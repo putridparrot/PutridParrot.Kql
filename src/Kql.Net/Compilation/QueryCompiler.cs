@@ -52,7 +52,7 @@ internal sealed partial class QueryCompiler
                 case LetStatement let:
                     CompileLet(let);
                     break;
-                case ExpressionStatement { Expression: var e } when e.ResultType is TableSymbol:
+                case ExpressionStatement { Expression: var e } when e.ResultType is TableSymbol || e is PipeExpression or QueryOperator:
                     results.Add(CompileTabular(e));
                     break;
                 case ExpressionStatement es:
@@ -158,6 +158,12 @@ internal sealed partial class QueryCompiler
                 return InlineTabularFunction(fc);
             case MaterializeExpression m:
                 return Materialize(CompileTabular(m.Expression));
+            case SearchOperator search:
+                return Search(null, search);
+            case FindOperator find:
+                return Find(find);
+            case QueryOperator op when _contextInputs.Count > 0:
+                return ApplyOperator(_contextInputs.Peek(), op);
             case ToTableExpression tt:
                 return CompileTabular(tt.Expression);
             default:

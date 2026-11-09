@@ -35,8 +35,21 @@ public class DiagnosticTests
     [Fact]
     public void UnsupportedOperator_ThrowsNotSupportedWithPosition()
     {
-        var ex = Assert.Throws<KqlNotSupportedException>(() => _kql.Execute("Orders | render barchart"));
-        Assert.Equal("render", ex.Feature);
+        var ex = Assert.Throws<KqlNotSupportedException>(() => _kql.Execute("Orders | fork (take 1)"));
+        Assert.Equal("fork", ex.Feature);
         Assert.Equal(9, ex.Position);
+    }
+
+    [Fact]
+    public void UnsupportedPlugin_IsReported()
+    {
+        var ex = Assert.Throws<KqlNotSupportedException>(() => _kql.Execute("Orders | evaluate autocluster()"));
+        Assert.Equal("evaluate autocluster", ex.Feature);
+    }
+
+    [Fact]
+    public void Render_IsAcceptedAndIgnored()
+    {
+        Assert.Equal(6, _kql.Execute("Orders | render barchart").Count);
     }
 }

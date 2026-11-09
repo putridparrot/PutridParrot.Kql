@@ -53,8 +53,15 @@ result is the same; only where the work happens changes. Write your own translat
 | `mv-expand` (multiple columns, `to typeof()`, `with_itemindex`, `bagexpansion`, `limit`) | ✅ | Memory |
 | `parse` / `parse-where` (`kind=simple`, `relaxed`, `regex`, `flags=`) | ✅ | Memory |
 | Multiple statements (`ExecuteAll`) | ✅ | n/a |
-| `mv-apply`, `parse-kv`, `top-nested`, `make-series` | ⏳ | |
-| `render`, `evaluate` plugins, graph operators, `find`, `search`, `fork`, `facet`, cross-cluster/database | ❌ out of scope for now | |
+| `make-series` (`from`/`to`/`step` or `in range(...)`, `by`, per-aggregate `default=`, `kind=nonempty`) | ✅ | Memory |
+| `top-nested` (N or all, `with others`, `asc`/`desc`, named aggregates) | ✅ | Memory. The "others" row has nulls for deeper levels |
+| `mv-apply` (multiple arrays, `to typeof()`, `with_itemindex`, `limit`, any sub-query) | ✅ | Memory |
+| `parse-kv` (delimiters, `quote`, `escape`, `greedy`, non-specified delimiters, `regex`) | ✅ | Memory. A value that fails type conversion becomes null |
+| `evaluate bag_unpack` (prefix, explicit `: (schema)`), `evaluate pivot`, `evaluate narrow` | ✅ | Memory. The output columns depend on the data, so the input is read when the query is compiled; later operators see the new columns |
+| `search` (piped, `in (...)`, all tables, `Column:term`, `*` wildcards, `kind=case_sensitive`), `where * has ...` | ✅ | Memory |
+| `find in (...) where ... [project ...]` (`source_`, common columns, `pack_`) | ✅ | Memory |
+| `render` | ✅ accepted and ignored (there's nothing to draw) | n/a |
+| Other `evaluate` plugins, graph operators, `fork`, `facet`, cross-cluster/database | ❌ not supported (clear error) | |
 
 ## Scalar operators
 
@@ -73,7 +80,23 @@ negated), `like`, `matches regex`, `in`/`!in`/`in~` (literal lists, dynamic arra
 | Math | `abs`, `round`, `bin`/`floor`, `bin_at`, `ceiling`, `sqrt`, `pow`, `exp`, `exp2`, `exp10`, `log`, `log2`, `log10`, `sign`, `pi`, `rand`, `sin`, `cos`, `tan`, `isnan`, `isinf`, `isfinite`, `min_of`, `max_of` |
 | Datetime | `now`, `ago`, `startof/endof day/week/month/year`, `getyear`, `getmonth`/`monthofyear`, `dayofmonth`, `dayofyear`, `dayofweek`, `hourofday`, `week_of_year`, `datetime_add`, `datetime_diff`, `datetime_part`, `format_datetime`, `format_timespan`, `make_datetime`, `make_timespan`, `unixtime_*_todatetime` |
 | Dynamic | `array_length`, `pack_array`, `pack`/`bag_pack`, `pack_all`, `bag_keys`, `array_concat`, `array_index_of`, `set_has_element`, `array_sum`, `gettype` |
-| Misc | `new_guid`, `hash` |
+| Misc | `new_guid`, `hash`, `hash_sha1`, `hash_combine`, `hash_many`, `around`, `tohex`, `format_bytes`, `strcmp`, `string_size`, `translate`, `replace_strings`, `regex_quote`, `indexof_regex`, `extract_json`, `dynamic_to_json`, `isascii`, `isutf8`, `url_encode_component`, punycode, unicode code points |
+| Arrays / sets / bags | `array_reverse`, `array_rotate_*`, `array_shift_*`, `array_slice`, `array_split`, `array_sort_asc/desc`, `array_iff`, `strcat_array`, `zip`, `repeat`, `range`, `jaccard_index`, `set_union/intersect/difference/equals`, `bag_has_key`, `bag_merge`, `bag_remove_keys`, `bag_set_key`, `bag_zip` |
+| Parsing | `parse_url`, `parse_urlquery`, `parse_csv`, `parse_path`, `parse_version`, `parse_command_line` |
+| IP addresses | `parse_ipv4(_mask)`, `format_ipv4(_mask)`, `ipv4_compare`, `ipv4_is_match`, `ipv4_is_in_range`, `ipv4_is_in_any_range`, `ipv4_is_private`, `ipv4_netmask_suffix`, `ipv4_range_to_cidr_list`, `has_ipv4`, `has_ipv4_prefix`, `has_any_ipv4(_prefix)`, `parse_ipv6(_mask)`, `ipv6_compare`, `ipv6_is_match`, `ipv6_is_in_range`, `ipv6_is_in_any_range` |
+| Encoding / binary | `base64_*` (guid, array), `gzip_*`, `zlib_*`, `binary_and/or/xor/not/shift_*`, `bitset_count_ones` |
+| Time | `datetime_utc_to_local`, `datetime_local_to_utc` (IANA or Windows zone ids), `datetime_list_timezones`, `unixtime_microseconds/nanoseconds_todatetime` |
+| Math | also `acos`, `asin`, `atan`, `atan2`, `cot`, `degrees`, `radians` |
+| Sketches | `dcount_hll`, `percentile_tdigest`, `percentiles_array_tdigest`, `rank_tdigest`, `percentrank_tdigest` (Kql.Net's sketches are exact) |
+
+**Not implemented:**
+- The `geo_*` family.
+- `series_decompose*` and the other series analysis functions (`fft`, `periods`, `seasonal`, `fit_2lines`, `fit_poly`, `iir`), and the multi-column `series_stats`.
+- Statistical distributions (`beta_*`, `gamma`, `erf`) and unit conversions (`convert_*`).
+- `parse_xml` and `parse_user_agent`.
+- `hash_xxhash64`.
+- Functions that only exist inside a Kusto cluster: `cursor_*`, `extent_*`, `current_*`, `ingestion_time`, graph functions.
+| Series (dynamic arrays, e.g. from `make-series`) | `series_fill_forward`, `series_fill_backward`, `series_fill_const`, `series_fill_linear`, `series_stats_dynamic`, `series_add`, `series_subtract`, `series_multiply`, `series_divide`, `series_greater`, `series_less`, `series_fir` (e.g. moving averages) |
 | Window (need serialized input: after `sort`/`order`/`serialize`) | `row_number` (with start/restart), `prev`, `next` (offset, default), `row_cumsum` (restart), `row_rank_dense`, `row_rank_min`. Operators using them run in memory |
 
 Deterministic calls with constant arguments (e.g. `ago(1d)`) are evaluated once at compile time, so a provider
@@ -107,7 +130,13 @@ memory.
 `count`, `countif`, `sum`, `sumif`, `avg`, `avgif`, `min`, `max`, `minif`, `maxif`, `dcount`/`count_distinct`,
 `dcountif`, `take_any`/`any`, `take_anyif`, `make_list`, `make_list_if`, `make_list_with_nulls`, `make_set`,
 `make_set_if`, `make_bag`, `stdev`, `stdevp`, `variance`, `variancep`, `percentile` (nearest rank),
-`arg_max` / `arg_min` (explicit columns or `*`; rows with a null key are ignored).
+`arg_max` / `arg_min` (explicit columns or `*`; rows with a null key are ignored),
+`percentiles` (one column per percentile), `percentiles_array`, `percentilew`, `percentilesw`, `percentilesw_array`,
+`stdevif`, `varianceif`, `variancepif`, `make_bag_if`, `covariance`, `covariancep`, `covarianceif`, `covariancepif`,
+`binary_all_and`, `binary_all_or` and `binary_all_xor`.
+
+`hll`, `hll_if`, `hll_merge`, `tdigest`, `tdigest_merge` and `merge_tdigest` are also supported. Kusto uses
+approximate sketches for these; Kql.Net computes exact values instead (fine for in-memory sizes).
 
 `arg_max`/`arg_min` translate to SQL as one correlated subquery per output column. That is correct, but
 `arg_max(x, *)` on a wide table produces many subqueries.

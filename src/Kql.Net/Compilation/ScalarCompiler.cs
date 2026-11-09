@@ -53,6 +53,38 @@ internal sealed partial class ScalarCompiler
 
     internal IKqlQueryTranslator? Translator => _translator;
 
+    /// <summary>For `search`: term matching is case-sensitive (kind=case_sensitive).</summary>
+    internal bool SearchCaseSensitive { get; init; }
+
+    /// <summary>Columns excluded from "any column" searches (e.g. search's $table).</summary>
+    internal IReadOnlySet<string> SearchExcludedColumns { get; init; } = new HashSet<string>();
+
+    /// <summary>A search term against one string value: `abc` = has, `abc*` = hasprefix, `*abc` = hassuffix, `*abc*` = contains.</summary>
+    private LExpr SearchTerm(LExpr value, string term, bool cs)
+    {
+        RequiresClient = true;
+        var s = ExpressionHelpers.Coerce(value, typeof(string));
+        string method;
+        var core = term;
+        if (term.Length > 1 && term.StartsWith('*') && term.EndsWith('*')) { method = nameof(KqlFunctions.Contains); core = term[1..^1]; }
+        else if (term.EndsWith('*')) { method = nameof(KqlFunctions.HasPrefix); core = term[..^1]; }
+        else if (term.StartsWith('*')) { method = nameof(KqlFunctions.HasSuffix); core = term[1..]; }
+        else if (term.Contains('*'))
+            return LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.Like))!, s, LExpr.Constant(term.Replace('*', '%')), LExpr.Constant(cs));
+        else method = nameof(KqlFunctions.Has);
+        return LExpr.Call(typeof(KqlFunctions).GetMethod(method)!, s, LExpr.Constant(core), LExpr.Constant(cs));
+    }
+
+    /// <summary>True when any searchable column of the row satisfies <paramref name="test"/>.</summary>
+    private LExpr AnyColumn(Func<LExpr, LExpr> test)
+    {
+        if (_schema is null || _row is null) throw new KqlException("'*' can only be used in a row context.");
+        LExpr acc = LExpr.Constant(false);
+        foreach (var c in _schema.Columns.Where(c => !SearchExcludedColumns.Contains(c.Name)))
+            acc = LExpr.OrElse(acc, test(Read(c, _row)));
+        return acc;
+    }
+
     /// <summary>True when an approximate translation was used, so the exact predicate must be re-applied in memory.</summary>
     public bool UsedApproximation { get; private set; }
 
@@ -110,6 +142,9 @@ internal sealed partial class ScalarCompiler
     {
         switch (node)
         {
+            case LiteralExpression { LiteralValue: string term } searchTerm when searchTerm.ResultType == ScalarTypes.Bool:
+                // a bare string in a search predicate: does any column have the term?
+                return LExpr.Convert(AnyColumn(v => SearchTerm(v, term, SearchCaseSensitive)), typeof(bool?));
             case LiteralExpression lit:
                 return Literal(lit.LiteralValue, lit.ResultType);
             case CompoundStringLiteralExpression cs:
@@ -278,6 +313,10 @@ internal sealed partial class ScalarCompiler
             case SyntaxKind.NotLikeCsExpression: return StringOp(nameof(KqlFunctions.Like), b, true, true);
             case SyntaxKind.MatchesRegexExpression: return StringOp(nameof(KqlFunctions.MatchesRegex), b, null, false);
 
+            case SyntaxKind.SearchExpression when b.Right is LiteralExpression { LiteralValue: string columnTerm }:
+                // search's `Column:term`
+                return LExpr.Convert(SearchTerm(Compile(b.Left), columnTerm, SearchCaseSensitive), typeof(bool?));
+
             default:
                 throw new KqlNotSupportedException(b.Kind.ToString(), b.TextStart);
         }
@@ -285,6 +324,20 @@ internal sealed partial class ScalarCompiler
 
     private LExpr StringOp(string method, BinaryExpression b, bool? caseSensitive, bool negate)
     {
+        if (b.Left is StarExpression)
+        {
+            // `* has 'x'`: any column satisfies the operator
+            RequiresClient = true;
+            var term = ExpressionHelpers.Coerce(Compile(b.Right), typeof(string));
+            var any = AnyColumn(v =>
+            {
+                var callArgs = new List<LExpr> { ExpressionHelpers.Coerce(v, typeof(string)), term };
+                if (caseSensitive is { } c) callArgs.Add(LExpr.Constant(c));
+                return LExpr.Call(typeof(KqlFunctions).GetMethod(method, callArgs.Select(a => a.Type).ToArray())!, callArgs);
+            });
+            return LExpr.Convert(negate ? LExpr.Not(any) : any, typeof(bool?));
+        }
+
         var args = new List<LExpr>
         {
             ExpressionHelpers.Coerce(Compile(b.Left), typeof(string)),

@@ -84,6 +84,51 @@ internal sealed partial class ScalarCompiler
                 return ArgValue(args[0], name == "arg_max", (c, _) => c.Compile(args[0]));
             case "make_bag":
                 return Helper(nameof(KqlAggregates.MakeBag), g, args[0], MaxSize(args, 1));
+            case "make_bag_if":
+                return Helper(nameof(KqlAggregates.MakeBag), Where(g, args[1]), args[0], MaxSize(args, 2));
+            case "stdevif":
+                return Helper(nameof(KqlAggregates.Stdev), Where(g, args[1]), args[0]);
+            case "varianceif":
+                return Helper(nameof(KqlAggregates.Variance), Where(g, args[1]), args[0]);
+            case "variancepif":
+                return Helper(nameof(KqlAggregates.VarianceP), Where(g, args[1]), args[0]);
+            case "percentiles":
+                // one column per percentile; Summarize adds the others (PercentilesExtra)
+                return Helper(nameof(KqlAggregates.Percentile), g, args[0], Compile(args[1]));
+            case "percentiles_array":
+                return Helper(nameof(KqlAggregates.PercentilesArray), g, args[0], Percents(args.Skip(1)));
+            case "percentilew":
+            case "percentilesw":
+                return Rows(nameof(KqlAggregates.WeightedPercentile), g, [args[0], args[1]], Compile(args[2]));
+            case "percentilesw_array":
+                return Rows(nameof(KqlAggregates.WeightedPercentilesArray), g, [args[0], args[1]], Percents(args.Skip(2)));
+            case "covariance":
+                return Rows(nameof(KqlAggregates.Covariance), g, [args[0], args[1]], LExpr.Constant(true));
+            case "covariancep":
+                return Rows(nameof(KqlAggregates.Covariance), g, [args[0], args[1]], LExpr.Constant(false));
+            case "covarianceif":
+                return Rows(nameof(KqlAggregates.Covariance), Where(g, args[2]), [args[0], args[1]], LExpr.Constant(true));
+            case "covariancepif":
+                return Rows(nameof(KqlAggregates.Covariance), Where(g, args[2]), [args[0], args[1]], LExpr.Constant(false));
+            case "binary_all_and":
+                return Helper(nameof(KqlAggregates.BinaryAllAnd), g, args[0]);
+            case "binary_all_or":
+                return Helper(nameof(KqlAggregates.BinaryAllOr), g, args[0]);
+            case "binary_all_xor":
+                return Helper(nameof(KqlAggregates.BinaryAllXor), g, args[0]);
+            case "hll":
+                return Helper(nameof(KqlAggregates.Hll), g, args[0]);
+            case "hll_if":
+                return Helper(nameof(KqlAggregates.Hll), Where(g, args[1]), args[0]);
+            case "hll_merge":
+                return Helper(nameof(KqlAggregates.HllMerge), g, args[0]);
+            case "tdigest":
+                return args.Count > 1
+                    ? Rows(nameof(KqlAggregates.TdigestWeighted), g, [args[0], args[1]])
+                    : Helper(nameof(KqlAggregates.Tdigest), g, args[0]);
+            case "tdigest_merge":
+            case "merge_tdigest":
+                return Helper(nameof(KqlAggregates.TdigestMerge), g, args[0]);
             default:
                 throw new KqlNotSupportedException($"aggregate {name}()", fc.TextStart);
         }
@@ -129,6 +174,13 @@ internal sealed partial class ScalarCompiler
     private LExpr Sum(LExpr g, KExpr value, Type resultType)
     {
         // Enumerable.Sum has overloads for long?, double?, decimal?; widen int to long.
+        if (resultType == typeof(object))
+        {
+            // the type isn't known to Kusto (e.g. a column from bag_unpack): use the value's runtime type
+            var natural = Selector(value).ReturnType;
+            resultType = natural == typeof(int?) || natural == typeof(long?) ? typeof(long?)
+                : natural == typeof(decimal?) ? typeof(decimal?) : typeof(double?);
+        }
         var target = resultType == typeof(int?) ? typeof(long?) : resultType;
         if (target != typeof(long?) && target != typeof(double?) && target != typeof(decimal?)) target = typeof(double?);
         var selector = Selector(value, target);
@@ -213,6 +265,35 @@ internal sealed partial class ScalarCompiler
         var ordered = Enum(max ? "OrderByDescending" : "OrderBy", [rowType, key.Type], filtered, LExpr.Lambda(key, p));
         var selected = Enum("Select", [rowType, value.Type], ordered, LExpr.Lambda(value, p));
         return Enum("FirstOrDefault", [value.Type], selected);
+    }
+
+    /// <summary>The value of the <paramref name="index"/>-th percentile column of a percentiles()/percentilesw() call.</summary>
+    internal LExpr PercentilesExtra(FunctionCallExpression fc, int index)
+    {
+        var args = fc.ArgumentList.Expressions.Select(e => e.Element).ToList();
+        return fc.Name.SimpleName == "percentilesw"
+            ? Rows(nameof(KqlAggregates.WeightedPercentile), _group!.Group, [args[0], args[1]], Compile(args[2 + index]))
+            : Helper(nameof(KqlAggregates.Percentile), _group!.Group, args[0], Compile(args[1 + index]));
+    }
+
+    /// <summary>Percentile arguments (literals or a dynamic array) as an object[] expression.</summary>
+    private LExpr Percents(IEnumerable<KExpr> args) =>
+        LExpr.NewArrayInit(typeof(object), args.Select(a => ExpressionHelpers.Coerce(Compile(a), typeof(object))));
+
+    /// <summary>Calls a <see cref="KqlAggregates"/> helper over per-row tuples (object[] of several expressions).</summary>
+    private LExpr Rows(string method, LExpr g, KExpr[] values, params LExpr[] extra)
+    {
+        RequiresClient = true;
+        var rowType = _group!.RowSchema.RowType;
+        var p = LExpr.Parameter(rowType, "r");
+        var inner = new ScalarCompiler(_query, _group.RowSchema, p, translator: _translator);
+        var tuple = LExpr.Lambda(LExpr.NewArrayInit(typeof(object), values.Select(v => ExpressionHelpers.Coerce(inner.Compile(v), typeof(object)))), p);
+        var selected = Enum("Select", [rowType, typeof(object[])], g, tuple);
+        var mi = typeof(KqlAggregates).GetMethod(method)!;
+        var ps = mi.GetParameters();
+        var callArgs = new List<LExpr> { selected };
+        for (var i = 0; i < extra.Length; i++) callArgs.Add(ExpressionHelpers.Coerce(extra[i], ps[i + 1].ParameterType));
+        return LExpr.Call(mi, callArgs);
     }
 
     private LExpr MaxSize(List<KExpr> args, int index) =>

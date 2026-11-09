@@ -237,6 +237,15 @@ public static partial class KqlFunctions
         return d;
     }
 
+    /// <summary>Like pack(), but skipping null values (used by find's pack_ column).</summary>
+    public static object? PackNonNull(params object?[] keysAndValues)
+    {
+        var d = new Dictionary<string, object?>();
+        for (var i = 0; i + 1 < keysAndValues.Length; i += 2)
+            if (keysAndValues[i + 1] is not null) d[KqlConvert.ToStringValue(keysAndValues[i]) ?? ""] = Dynamic.Normalize(keysAndValues[i + 1]);
+        return d;
+    }
+
     [KqlFunction("bag_keys")]
     public static object? BagKeys(object? v) => Dynamic.Normalize(v) is Dictionary<string, object?> d ? d.Keys.Cast<object?>().ToList() : null;
 

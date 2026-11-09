@@ -23,10 +23,15 @@ internal sealed partial class QueryCompiler
                 return Extend(input, e.Expressions.Select(x => x.Element).ToList(), output!);
             case ProjectOperator p:
                 return Project(input, p.Expressions.Select(x => x.Element).ToList(), output!, "project");
-            case ProjectAwayOperator:
-            case ProjectKeepOperator:
+            case ProjectAwayOperator away:
+            {
+                var removed = NamePatterns(away.Expressions.Select(x => x.Element));
+                return Reshape(input, output!, new Dictionary<string, string>(), "project-away", name => !removed(name));
+            }
+            case ProjectKeepOperator keep:
+                return Reshape(input, output!, new Dictionary<string, string>(), "project-keep", NamePatterns(keep.Expressions.Select(x => x.Element)));
             case ProjectReorderOperator:
-                return Reshape(input, output!, new Dictionary<string, string>(), op.Kind.ToString());
+                return Reshape(input, output!, new Dictionary<string, string>(), "project-reorder");
             case ProjectRenameOperator pr:
                 return Reshape(input, output!, RenameMap(pr.Expressions.Select(x => x.Element)), "project-rename");
             case TakeOperator t:
@@ -60,6 +65,20 @@ internal sealed partial class QueryCompiler
                 return input;
             case GetSchemaOperator:
                 return GetSchema(input);
+            case EvaluateOperator ev:
+                return Evaluate(input, ev, output!);
+            case SearchOperator search:
+                return Search(input, search);
+            case RenderOperator:
+                return input; // visualisation hint: nothing to draw, the data passes through
+            case MakeSeriesOperator ms:
+                return MakeSeries(input, ms, output!);
+            case TopNestedOperator tn:
+                return TopNested(input, tn, output!);
+            case MvApplyOperator ma:
+                return MvApply(input, ma, output!);
+            case ParseKvOperator pk:
+                return ParseKv(input, pk, output!);
             case SampleOperator sample:
                 return Take(input, sample.Expression);
             default:
@@ -106,6 +125,49 @@ internal sealed partial class QueryCompiler
 
     private static IReadOnlyList<(string, ScalarSymbol)> Columns(TableSymbol table) =>
         table.Columns.Select(c => (c.Name, RowSchema.AsScalar(c.Type))).ToArray();
+
+    /// <summary>
+    /// The operator's output columns as Kusto declares them, made concrete against the input actually produced:
+    /// columns Kusto types as unknown take the input's runtime type, and for open (data-dependent) schemas, e.g. after
+    /// `evaluate bag_unpack`, input columns Kusto doesn't know about are carried through when <paramref name="keepExtra"/> allows.
+    /// </summary>
+    private static List<(string Name, ScalarSymbol Type)> Columns(TableSymbol table, PlanNode input, Func<string, bool>? keepExtra = null,
+        IReadOnlyDictionary<string, string>? renames = null)
+    {
+        var cols = table.Columns.Select(c =>
+        {
+            var type = RowSchema.AsScalar(c.Type);
+            var source = renames is not null && renames.TryGetValue(c.Name, out var old) ? old : c.Name;
+            if ((type == ScalarTypes.Unknown || c.Type.IsError) && input.Schema.Find(source) is { } ic) type = ic.KqlType;
+            return (c.Name, type);
+        }).ToList();
+
+        if (table.IsOpen && keepExtra is not null)
+        {
+            // follow the input's actual column order: kept/renamed input columns first, then new columns
+            var declared = cols.ToDictionary(c => c.Name, c => c.Item2, StringComparer.Ordinal);
+            var newName = (renames ?? new Dictionary<string, string>()).ToDictionary(kv => kv.Value, kv => kv.Key, StringComparer.Ordinal);
+            var ordered = new List<(string Name, ScalarSymbol Type)>();
+            foreach (var c in input.Schema.Columns)
+            {
+                var name = newName.TryGetValue(c.Name, out var renamed) ? renamed : c.Name;
+                if (declared.TryGetValue(name, out var type)) ordered.Add((name, type == ScalarTypes.Unknown ? c.KqlType : type));
+                else if (keepExtra(c.Name)) ordered.Add((name, c.KqlType));
+            }
+            var present = ordered.Select(c => c.Name).ToHashSet(StringComparer.Ordinal);
+            ordered.AddRange(cols.Where(c => !present.Contains(c.Name) && input.Schema.Find(c.Name) is null));
+            return ordered;
+        }
+        return cols;
+    }
+
+    /// <summary>Glob match for project-away/keep patterns (`*` wildcards).</summary>
+    private static Func<string, bool> NamePatterns(IEnumerable<KExpr> patterns)
+    {
+        var regexes = patterns.Select(p => new System.Text.RegularExpressions.Regex(
+            "^" + System.Text.RegularExpressions.Regex.Escape(p.ToString().Trim()).Replace(@"\*", ".*") + "$")).ToList();
+        return name => regexes.Any(r => r.IsMatch(name));
+    }
 
     private static bool UsesWindowFunctions(IEnumerable<SyntaxNode>? nodes)
     {
@@ -176,7 +238,8 @@ internal sealed partial class QueryCompiler
             if (!assigned.ContainsKey(c.Name) && input.Schema.Find(c.Name) is null) assigned[c.Name] = unnamed.Dequeue();
         }
 
-        return Select(input, Columns(output), (compiler, row) => output.Columns.Select(c =>
+        var columns = Columns(output, input, _ => true);
+        return Select(input, columns, (compiler, row) => columns.Select(c =>
             assigned.TryGetValue(c.Name, out var expr) ? compiler.Compile(expr) : compiler.Read(input.Schema.Get(c.Name), row)).ToList(),
             name, expressions);
     }
@@ -190,7 +253,7 @@ internal sealed partial class QueryCompiler
                 return Reshape(input, output, RenameMap(expressions), name);
             throw new KqlNotSupportedException($"{name} with wildcard or tuple expressions", expressions.FirstOrDefault()?.TextStart ?? 0);
         }
-        return Select(input, Columns(output), (compiler, _) => expressions.Select(compiler.Compile).ToList(), name, expressions);
+        return Select(input, Columns(output, input), (compiler, _) => expressions.Select(compiler.Compile).ToList(), name, expressions);
     }
 
     /// <summary>new name -> old name for `new = old` pairs.</summary>
@@ -205,12 +268,15 @@ internal sealed partial class QueryCompiler
     }
 
     /// <summary>Re-shapes rows to the output schema, taking each column from the input by (possibly renamed) name.</summary>
-    private PlanNode Reshape(PlanNode input, TableSymbol output, Dictionary<string, string> renames, string name) =>
-        Select(input, Columns(output), (compiler, row) => output.Columns.Select(c =>
+    private PlanNode Reshape(PlanNode input, TableSymbol output, Dictionary<string, string> renames, string name, Func<string, bool>? keepExtra = null)
+    {
+        var columns = Columns(output, input, keepExtra ?? (_ => true), renames);
+        return Select(input, columns, (compiler, row) => columns.Select(c =>
         {
             var source = renames.TryGetValue(c.Name, out var old) ? old : c.Name;
             return compiler.Read(input.Schema.Get(source), row);
         }).ToList(), name);
+    }
 
     // ------------------------------------------------------------------ take / sort / count / distinct
 
@@ -345,6 +411,11 @@ internal sealed partial class QueryCompiler
                     values.Add(aggCompiler.ArgValue(args[0], max, (c, r) => col is not null ? c.Read(col, r) : c.Compile(expr!)));
                 }
             }
+            else if (widths[i] > 1 && PercentilesCall(aggExprs[i]) is { } percentiles)
+            {
+                // percentiles(x, 50, 90, ...): one column per percentile
+                for (var k = 1; k < widths[i]; k++) values.Add(aggCompiler.PercentilesExtra(percentiles, k));
+            }
             column += widths[i];
         }
         var resultSelector = LExpr.Lambda(outSchema.New(values), g);
@@ -366,6 +437,11 @@ internal sealed partial class QueryCompiler
             return ExpressionHelpers.ToClientQuery(rows.CastTo(outSchema.RowType), outSchema.RowType);
         }, "summarize", keepsProvider: byExprs.Count > 0 ? null : false);
     }
+
+    private static FunctionCallExpression? PercentilesCall(KExpr aggregate) =>
+        (aggregate is SimpleNamedExpression sn ? sn.Expression : aggregate) is FunctionCallExpression { Name.SimpleName: "percentiles" or "percentilesw" } fc
+            ? fc
+            : null;
 
     private static FunctionCallExpression? ArgCall(KExpr aggregate) =>
         (aggregate is SimpleNamedExpression sn ? sn.Expression : aggregate) is FunctionCallExpression { Name.SimpleName: "arg_max" or "arg_min" } fc
@@ -392,6 +468,11 @@ internal sealed partial class QueryCompiler
                     continue;
                 }
                 widths[i] = args.Count;
+            }
+            else if (PercentilesCall(aggregates[i]) is { } percentiles)
+            {
+                var count = percentiles.ArgumentList.Expressions.Count;
+                widths[i] = percentiles.Name.SimpleName == "percentilesw" ? count - 2 : count - 1;
             }
             else
             {

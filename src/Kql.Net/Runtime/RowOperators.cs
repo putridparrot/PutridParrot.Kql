@@ -28,6 +28,46 @@ public static class RowOperators
         }
     }
 
+    /// <summary>
+    /// mv-apply: expands each record (like mv-expand) into a sub-table, runs the sub-query over it, and combines each
+    /// sub-query row with the record.
+    /// </summary>
+    public static IEnumerable<TOut> MvApply<TIn, TContext, TSub, TOut>(IEnumerable<TIn> rows, Func<TIn, object?[]> values,
+        Func<TIn, object?[], long, TContext> makeContext, long? limit, Func<List<TContext>, IEnumerable<TSub>> subQuery,
+        Func<TIn, TSub, TOut> make)
+    {
+        foreach (var row in rows)
+        {
+            var lists = values(row).Select(v => Elements(v, bagAsArray: false)).ToArray();
+            var count = lists.Length == 0 ? 0 : lists.Max(l => l.Count);
+            if (limit is { } max) count = (int)Math.Min(count, Math.Max(0, max));
+            var context = new List<TContext>(count);
+            for (var i = 0; i < count; i++)
+            {
+                var items = new object?[lists.Length];
+                for (var j = 0; j < lists.Length; j++) items[j] = i < lists[j].Count ? lists[j][i] : null;
+                context.Add(makeContext(row, items, i));
+            }
+            foreach (var sub in subQuery(context)) yield return make(row, sub);
+        }
+    }
+
+    /// <summary>parse-kv: extracts the listed keys and converts them (a value that won't convert becomes null).</summary>
+    public static IEnumerable<TOut> ParseKv<TIn, TOut>(IEnumerable<TIn> rows, Func<TIn, string?> source, string[] keys, Type[] types,
+        KeyValueSpec spec, Func<TIn, object?[], TOut> make)
+    {
+        foreach (var row in rows)
+        {
+            var raw = KeyValueParser.Extract(source(row), keys, spec);
+            var values = new object?[keys.Length];
+            for (var i = 0; i < keys.Length; i++)
+                values[i] = types[i] == typeof(object) ? Dynamic.Parse(raw[i])
+                    : types[i] == typeof(string) ? raw[i] ?? ""
+                    : KqlConvert.ChangeType(raw[i], types[i]);
+            yield return make(row, values);
+        }
+    }
+
     private static List<object?> Elements(object? value, bool bagAsArray) => Dynamic.Normalize(value) switch
     {
         null => [null],
