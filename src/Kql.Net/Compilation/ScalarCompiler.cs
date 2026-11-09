@@ -1,0 +1,566 @@
+using System.Linq.Expressions;
+using System.Reflection;
+using Kql.Net.Runtime;
+using Kql.Net.Schema;
+using Kusto.Language.Symbols;
+using Kusto.Language.Syntax;
+using BinaryExpression = Kusto.Language.Syntax.BinaryExpression;
+using RowSchema = Kql.Net.Runtime.RowSchema;
+using DynamicExpression = Kusto.Language.Syntax.DynamicExpression;
+using KExpr = Kusto.Language.Syntax.Expression;
+using LExpr = System.Linq.Expressions.Expression;
+
+namespace Kql.Net.Compilation;
+
+/// <summary>Context for compiling an aggregate: the group (an <c>IEnumerable&lt;TRow&gt;</c>) and its row schema.</summary>
+internal sealed record GroupContext(LExpr Group, RowSchema RowSchema);
+
+/// <summary>
+/// Compiles bound Kusto scalar expressions into LINQ expressions over a row parameter.
+/// </summary>
+internal sealed partial class ScalarCompiler
+{
+    private static readonly MethodInfo GetMemberMethod = typeof(KqlConvert).GetMethod(nameof(KqlConvert.GetMember))!;
+    private static readonly MethodInfo GetElementMethod = typeof(KqlConvert).GetMethod(nameof(KqlConvert.GetElement))!;
+
+    private static readonly HashSet<string> NonDeterministic = new(StringComparer.Ordinal) { "rand", "new_guid", "newguid" };
+
+    private readonly QueryCompiler _query;
+    private readonly RowSchema? _schema;
+    private readonly LExpr? _row;
+    private readonly GroupContext? _group;
+
+    public ScalarCompiler(QueryCompiler query, RowSchema? schema, LExpr? row, GroupContext? group = null)
+    {
+        _query = query;
+        _schema = schema;
+        _row = row;
+        _group = group;
+    }
+
+    /// <summary>True when the compiled expression needs in-memory (client) evaluation.</summary>
+    public bool RequiresClient { get; private set; }
+
+    public LExpr Compile(KExpr node)
+    {
+        var result = CompileCore(node);
+        if (node.ResultType is ScalarSymbol s && s != ScalarTypes.Unknown && s != ScalarTypes.Null)
+        {
+            var target = KqlTypes.ClrTypeFor(s);
+            if (result.Type != target && !(result.Type == typeof(bool) && target == typeof(bool?)))
+                result = ExpressionHelpers.Coerce(result, target);
+        }
+        return result;
+    }
+
+    /// <summary>Compiles a predicate (null => false).</summary>
+    public LExpr CompilePredicate(KExpr node) => ExpressionHelpers.ToPredicate(Compile(node));
+
+    private LExpr CompileCore(KExpr node)
+    {
+        switch (node)
+        {
+            case LiteralExpression lit:
+                return Literal(lit.LiteralValue, lit.ResultType);
+            case CompoundStringLiteralExpression cs:
+                return LExpr.Constant(cs.LiteralValue as string, typeof(string));
+            case DynamicExpression dyn:
+                return LExpr.Constant(JsonLiteral(dyn.Expression), typeof(object));
+            case ParenthesizedExpression p:
+                return Compile(p.Expression);
+            case NameReference nr:
+                return NameRef(nr);
+            case BracketedExpression b:
+                return Compile(b.Expression);
+            case PrefixUnaryExpression u:
+                return Unary(u);
+            case BinaryExpression b:
+                return Binary(b);
+            case InExpression ie:
+                return In(ie);
+            case BetweenExpression be:
+                return Between(be);
+            case HasAnyExpression ha:
+                return HasAnyAll(ha.Left, ha.Right, all: false);
+            case HasAllExpression hl:
+                return HasAnyAll(hl.Left, hl.Right, all: true);
+            case PathExpression path:
+                return Path(path);
+            case ElementExpression el:
+                return Element(el);
+            case FunctionCallExpression fc:
+                return Call(fc);
+            case ToScalarExpression ts:
+                return LExpr.Constant(_query.EvaluateScalar(ts.Expression), KqlTypes.ClrTypeFor(ts.ResultType));
+            case SimpleNamedExpression sn:
+                return Compile(sn.Expression);
+            case OrderedExpression oe:
+                return Compile(oe.Expression);
+            default:
+                throw new KqlNotSupportedException(node.Kind.ToString(), node.TextStart);
+        }
+    }
+
+    /// <summary>Builds a dynamic value from KQL JSON literal syntax (which allows single quotes, datetime(...), etc.).</summary>
+    private object? JsonLiteral(KExpr e) => e switch
+    {
+        JsonObjectExpression o => o.Pairs.Aggregate(new Dictionary<string, object?>(), (d, p) =>
+        {
+            d[p.Element.Name.ValueText] = JsonLiteral(p.Element.Value);
+            return d;
+        }),
+        JsonArrayExpression a => a.Values.Select(v => JsonLiteral(v.Element)).ToList(),
+        LiteralExpression l => Dynamic.Normalize(l.LiteralValue),
+        _ => Dynamic.Normalize(_query.EvaluateScalar(e))
+    };
+
+    private static LExpr Literal(object? value, TypeSymbol type)
+    {
+        var target = KqlTypes.ClrTypeFor(type);
+        if (value is null) return LExpr.Constant(null, KqlTypes.MakeNullable(target));
+        var converted = KqlConvert.ChangeType(value, target);
+        return LExpr.Constant(converted, target);
+    }
+
+    private LExpr NameRef(NameReference nr)
+    {
+        switch (nr.ReferencedSymbol)
+        {
+            case ColumnSymbol col:
+                return ReadColumn(col.Name, nr);
+            case VariableSymbol v when _query.TryGetScalarLet(v, out var value):
+                return value;
+            case VariableSymbol { IsConstant: true } v:
+                return Literal(v.ConstantValue, v.Type);
+            case ParameterSymbol or VariableSymbol when _query.TryGetParameter(nr.SimpleName, out var pv):
+                return pv;
+            case FunctionSymbol fs:
+                // a function referenced without parens, e.g. `now`
+                return BindFunction(fs.Name, [], nr);
+            default:
+                if (_query.TryGetParameter(nr.SimpleName, out var param)) return param;
+                if (_schema?.Find(nr.SimpleName) is not null) return ReadColumn(nr.SimpleName, nr);
+                throw new KqlNotSupportedException($"reference to '{nr.SimpleName}' ({nr.ReferencedSymbol?.Kind})", nr.TextStart);
+        }
+    }
+
+    private LExpr ReadColumn(string name, SyntaxNode at)
+    {
+        if (_schema is null || _row is null)
+            throw new KqlException($"Column '{name}' cannot be referenced here (position {at.TextStart}).");
+        return Read(_schema.Get(name), _row);
+    }
+
+    /// <summary>Reads a column, noting whether the read needs client-side evaluation.</summary>
+    internal LExpr Read(RowColumn column, LExpr row)
+    {
+        RequiresClient |= column.ClientOnly;
+        return column.Read(row);
+    }
+
+    // ------------------------------------------------------------------ operators
+
+    private LExpr Unary(PrefixUnaryExpression u)
+    {
+        var operand = Compile(u.Expression);
+        return u.Kind switch
+        {
+            SyntaxKind.UnaryMinusExpression => LExpr.Negate(operand.Type == typeof(object) ? ExpressionHelpers.Coerce(operand, typeof(double?)) : operand),
+            SyntaxKind.UnaryPlusExpression => operand,
+            _ => throw new KqlNotSupportedException(u.Kind.ToString(), u.TextStart)
+        };
+    }
+
+    private LExpr Binary(BinaryExpression b)
+    {
+        switch (b.Kind)
+        {
+            case SyntaxKind.AddExpression: return Arithmetic(ExpressionType.Add, b);
+            case SyntaxKind.SubtractExpression: return Arithmetic(ExpressionType.Subtract, b);
+            case SyntaxKind.MultiplyExpression: return Arithmetic(ExpressionType.Multiply, b);
+            case SyntaxKind.DivideExpression: return Arithmetic(ExpressionType.Divide, b);
+            case SyntaxKind.ModuloExpression: return Arithmetic(ExpressionType.Modulo, b);
+
+            case SyntaxKind.LessThanExpression: return Comparison(ExpressionType.LessThan, b);
+            case SyntaxKind.LessThanOrEqualExpression: return Comparison(ExpressionType.LessThanOrEqual, b);
+            case SyntaxKind.GreaterThanExpression: return Comparison(ExpressionType.GreaterThan, b);
+            case SyntaxKind.GreaterThanOrEqualExpression: return Comparison(ExpressionType.GreaterThanOrEqual, b);
+            case SyntaxKind.EqualExpression: return Comparison(ExpressionType.Equal, b);
+            case SyntaxKind.NotEqualExpression: return Comparison(ExpressionType.NotEqual, b);
+
+            case SyntaxKind.AndExpression:
+                return LExpr.Convert(LExpr.AndAlso(CompilePredicate(b.Left), CompilePredicate(b.Right)), typeof(bool?));
+            case SyntaxKind.OrExpression:
+                return LExpr.Convert(LExpr.OrElse(CompilePredicate(b.Left), CompilePredicate(b.Right)), typeof(bool?));
+
+            case SyntaxKind.EqualTildeExpression: return StringOp(nameof(KqlFunctions.EqualsIgnoreCase), b, null, false);
+            case SyntaxKind.BangTildeExpression: return StringOp(nameof(KqlFunctions.EqualsIgnoreCase), b, null, true);
+
+            case SyntaxKind.HasExpression: return StringOp(nameof(KqlFunctions.Has), b, false, false);
+            case SyntaxKind.HasCsExpression: return StringOp(nameof(KqlFunctions.Has), b, true, false);
+            case SyntaxKind.NotHasExpression: return StringOp(nameof(KqlFunctions.Has), b, false, true);
+            case SyntaxKind.NotHasCsExpression: return StringOp(nameof(KqlFunctions.Has), b, true, true);
+            case SyntaxKind.HasPrefixExpression: return StringOp(nameof(KqlFunctions.HasPrefix), b, false, false);
+            case SyntaxKind.HasPrefixCsExpression: return StringOp(nameof(KqlFunctions.HasPrefix), b, true, false);
+            case SyntaxKind.NotHasPrefixExpression: return StringOp(nameof(KqlFunctions.HasPrefix), b, false, true);
+            case SyntaxKind.NotHasPrefixCsExpression: return StringOp(nameof(KqlFunctions.HasPrefix), b, true, true);
+            case SyntaxKind.HasSuffixExpression: return StringOp(nameof(KqlFunctions.HasSuffix), b, false, false);
+            case SyntaxKind.HasSuffixCsExpression: return StringOp(nameof(KqlFunctions.HasSuffix), b, true, false);
+            case SyntaxKind.NotHasSuffixExpression: return StringOp(nameof(KqlFunctions.HasSuffix), b, false, true);
+            case SyntaxKind.NotHasSuffixCsExpression: return StringOp(nameof(KqlFunctions.HasSuffix), b, true, true);
+            case SyntaxKind.ContainsExpression: return StringOp(nameof(KqlFunctions.Contains), b, false, false);
+            case SyntaxKind.ContainsCsExpression: return StringOp(nameof(KqlFunctions.Contains), b, true, false);
+            case SyntaxKind.NotContainsExpression: return StringOp(nameof(KqlFunctions.Contains), b, false, true);
+            case SyntaxKind.NotContainsCsExpression: return StringOp(nameof(KqlFunctions.Contains), b, true, true);
+            case SyntaxKind.StartsWithExpression: return StringOp(nameof(KqlFunctions.StartsWith), b, false, false);
+            case SyntaxKind.StartsWithCsExpression: return StringOp(nameof(KqlFunctions.StartsWith), b, true, false);
+            case SyntaxKind.NotStartsWithExpression: return StringOp(nameof(KqlFunctions.StartsWith), b, false, true);
+            case SyntaxKind.NotStartsWithCsExpression: return StringOp(nameof(KqlFunctions.StartsWith), b, true, true);
+            case SyntaxKind.EndsWithExpression: return StringOp(nameof(KqlFunctions.EndsWith), b, false, false);
+            case SyntaxKind.EndsWithCsExpression: return StringOp(nameof(KqlFunctions.EndsWith), b, true, false);
+            case SyntaxKind.NotEndsWithExpression: return StringOp(nameof(KqlFunctions.EndsWith), b, false, true);
+            case SyntaxKind.NotEndsWithCsExpression: return StringOp(nameof(KqlFunctions.EndsWith), b, true, true);
+            case SyntaxKind.LikeExpression: return StringOp(nameof(KqlFunctions.Like), b, false, false);
+            case SyntaxKind.LikeCsExpression: return StringOp(nameof(KqlFunctions.Like), b, true, false);
+            case SyntaxKind.NotLikeExpression: return StringOp(nameof(KqlFunctions.Like), b, false, true);
+            case SyntaxKind.NotLikeCsExpression: return StringOp(nameof(KqlFunctions.Like), b, true, true);
+            case SyntaxKind.MatchesRegexExpression: return StringOp(nameof(KqlFunctions.MatchesRegex), b, null, false);
+
+            default:
+                throw new KqlNotSupportedException(b.Kind.ToString(), b.TextStart);
+        }
+    }
+
+    private LExpr StringOp(string method, BinaryExpression b, bool? caseSensitive, bool negate)
+    {
+        var args = new List<LExpr>
+        {
+            ExpressionHelpers.Coerce(Compile(b.Left), typeof(string)),
+            ExpressionHelpers.Coerce(Compile(b.Right), typeof(string))
+        };
+        if (caseSensitive is { } cs) args.Add(LExpr.Constant(cs));
+        var mi = typeof(KqlFunctions).GetMethod(method, args.Select(a => a.Type).ToArray())!;
+        RequiresClient = true;
+        LExpr call = LExpr.Call(mi, args);
+        if (negate) call = LExpr.Not(call);
+        return LExpr.Convert(call, typeof(bool?));
+    }
+
+    private LExpr Arithmetic(ExpressionType op, BinaryExpression b)
+    {
+        var left = Compile(b.Left);
+        var right = Compile(b.Right);
+        var resultType = KqlTypes.ClrTypeFor(b.ResultType);
+
+        if (KqlTypes.IsNumeric(resultType) && (KqlTypes.IsNumeric(left.Type) || left.Type == typeof(object))
+                                           && (KqlTypes.IsNumeric(right.Type) || right.Type == typeof(object)))
+        {
+            left = ExpressionHelpers.Coerce(left, resultType);
+            right = ExpressionHelpers.Coerce(right, resultType);
+            if (op is ExpressionType.Divide or ExpressionType.Modulo && resultType != typeof(double?))
+            {
+                // integer/decimal division by zero yields null in KQL
+                var zero = LExpr.Constant(Activator.CreateInstance(System.Nullable.GetUnderlyingType(resultType)!), resultType);
+                return LExpr.Condition(LExpr.Equal(right, zero), LExpr.Constant(null, resultType), LExpr.MakeBinary(op, left, right));
+            }
+            return LExpr.MakeBinary(op, left, right);
+        }
+
+        // datetime / timespan arithmetic
+        left = Nullable(left);
+        right = Nullable(right);
+        if (left.Type == typeof(TimeSpan?) && KqlTypes.IsNumeric(right.Type)) right = ExpressionHelpers.Coerce(right, typeof(double?));
+        if (right.Type == typeof(TimeSpan?) && KqlTypes.IsNumeric(left.Type))
+        {
+            (left, right) = (right, ExpressionHelpers.Coerce(left, typeof(double?)));
+        }
+        if (left.Type == typeof(object)) left = ExpressionHelpers.Coerce(left, right.Type);
+        if (right.Type == typeof(object)) right = ExpressionHelpers.Coerce(right, left.Type);
+
+        try
+        {
+            var r = LExpr.MakeBinary(op, left, right);
+            return ExpressionHelpers.Coerce(r, resultType);
+        }
+        catch (InvalidOperationException)
+        {
+            throw new KqlNotSupportedException($"operator {op} on {b.Left.ResultType.Name} and {b.Right.ResultType.Name}", b.TextStart);
+        }
+    }
+
+    private static LExpr Nullable(LExpr e) => e.Type.IsValueType && System.Nullable.GetUnderlyingType(e.Type) is null
+        ? LExpr.Convert(e, KqlTypes.MakeNullable(e.Type))
+        : e;
+
+    private LExpr Comparison(ExpressionType op, BinaryExpression b)
+    {
+        var (left, right) = Unify(Compile(b.Left), Compile(b.Right));
+
+        LExpr result;
+        if (left.Type == typeof(string) && op is not (ExpressionType.Equal or ExpressionType.NotEqual))
+        {
+            RequiresClient = true;
+            var cmp = LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.CompareOrdinal))!, left, right);
+            result = LExpr.MakeBinary(op, cmp, LExpr.Constant(0));
+        }
+        else if (left.Type == typeof(object))
+        {
+            RequiresClient = true;
+            LExpr eq = LExpr.Call(typeof(KqlComparer).GetMethod(nameof(KqlComparer.ValueEquals))!, left, right);
+            result = op switch
+            {
+                ExpressionType.Equal => eq,
+                ExpressionType.NotEqual => LExpr.Not(eq),
+                _ => throw new KqlNotSupportedException("ordering comparison of dynamic values", b.TextStart)
+            };
+        }
+        else
+        {
+            result = LExpr.MakeBinary(op, left, right);
+        }
+        return LExpr.Convert(result, typeof(bool?));
+    }
+
+    /// <summary>Brings two operands to a common runtime type for comparison.</summary>
+    internal static (LExpr, LExpr) Unify(LExpr left, LExpr right)
+    {
+        if (left.Type == right.Type) return (left, right);
+        if (left is ConstantExpression { Value: null }) return (LExpr.Constant(null, KqlTypes.MakeNullable(right.Type)), Nullable(right));
+        if (right is ConstantExpression { Value: null }) return (Nullable(left), LExpr.Constant(null, KqlTypes.MakeNullable(left.Type)));
+        if (KqlTypes.IsNumeric(left.Type) && KqlTypes.IsNumeric(right.Type))
+        {
+            var t = KqlTypes.WidestNumeric(left.Type, right.Type);
+            return (ExpressionHelpers.Coerce(left, t), ExpressionHelpers.Coerce(right, t));
+        }
+        if (left.Type == typeof(object)) return (ExpressionHelpers.Coerce(left, KqlTypes.MakeNullable(right.Type)), Nullable(right));
+        if (right.Type == typeof(object)) return (Nullable(left), ExpressionHelpers.Coerce(right, KqlTypes.MakeNullable(left.Type)));
+        var l = Nullable(left);
+        var r = Nullable(right);
+        if (l.Type == r.Type) return (l, r);
+        return (l, ExpressionHelpers.Coerce(r, l.Type));
+    }
+
+    private LExpr In(InExpression ie)
+    {
+        var left = Compile(ie.Left);
+        var negate = ie.Kind is SyntaxKind.NotInExpression or SyntaxKind.NotInCsExpression;
+        var caseInsensitive = ie.Kind is SyntaxKind.InCsExpression or SyntaxKind.NotInCsExpression; // `in~` / `!in~`
+
+        var items = new List<object?>();
+        var exprs = new List<LExpr>();
+        foreach (var se in ie.Right.Expressions)
+        {
+            var e = se.Element;
+            if (e.ResultType is TableSymbol)
+            {
+                items.AddRange(_query.EvaluateColumn(e));
+                continue;
+            }
+            var compiled = Compile(e);
+            if (compiled.Type == typeof(object) && compiled is ConstantExpression { Value: List<object?> list })
+            {
+                items.AddRange(list);
+                continue;
+            }
+            if (compiled is ConstantExpression c)
+            {
+                items.Add(c.Value);
+                continue;
+            }
+            exprs.Add(compiled);
+        }
+
+        LExpr result;
+        if (caseInsensitive)
+        {
+            RequiresClient = true;
+            var all = items.Select(i => (LExpr)LExpr.Constant(KqlConvert.ToStringValue(i), typeof(string)))
+                .Concat(exprs.Select(e => ExpressionHelpers.Coerce(e, typeof(string))));
+            result = LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.InIgnoreCase))!,
+                ExpressionHelpers.Coerce(left, typeof(string)), LExpr.NewArrayInit(typeof(string), all));
+        }
+        else
+        {
+            var elementType = left.Type == typeof(object) ? typeof(object) : Nullable(left).Type;
+            var typedLeft = left.Type == typeof(object) ? left : Nullable(left);
+            LExpr? acc = null;
+            if (items.Count > 0)
+            {
+                var arr = Array.CreateInstance(elementType, items.Count);
+                for (var i = 0; i < items.Count; i++) arr.SetValue(KqlConvert.ChangeType(Dynamic.Normalize(items[i]), elementType), i);
+                acc = LExpr.Call(typeof(Enumerable).GetMethods().First(m => m.Name == "Contains" && m.GetParameters().Length == 2)
+                    .MakeGenericMethod(elementType), LExpr.Constant(arr), typedLeft);
+            }
+            foreach (var e in exprs)
+            {
+                var (l, r) = Unify(typedLeft, e);
+                LExpr eq = LExpr.Equal(l, r);
+                acc = acc is null ? eq : LExpr.OrElse(acc, eq);
+            }
+            result = acc ?? LExpr.Constant(false);
+        }
+
+        if (negate) result = LExpr.Not(result);
+        return LExpr.Convert(result, typeof(bool?));
+    }
+
+    private LExpr Between(BetweenExpression be)
+    {
+        var value = Compile(be.Left);
+        var lo = Compile(be.Right.First);
+        var hi = Compile(be.Right.Second);
+        if (Nullable(value).Type == typeof(DateTime?) && Nullable(hi).Type == typeof(TimeSpan?))
+            hi = LExpr.Add(Nullable(lo), Nullable(hi));
+
+        var (v1, l) = Unify(value, lo);
+        var (v2, h) = Unify(value, hi);
+        LExpr result = LExpr.AndAlso(LExpr.GreaterThanOrEqual(v1, l), LExpr.LessThanOrEqual(v2, h));
+        if (be.Kind == SyntaxKind.NotBetweenExpression) result = LExpr.Not(result);
+        return LExpr.Convert(result, typeof(bool?));
+    }
+
+    private LExpr HasAnyAll(KExpr left, ExpressionList right, bool all)
+    {
+        RequiresClient = true;
+        var terms = new List<LExpr>();
+        foreach (var se in right.Expressions)
+        {
+            var c = Compile(se.Element);
+            if (c is ConstantExpression { Value: List<object?> list })
+                terms.AddRange(list.Select(x => (LExpr)LExpr.Constant(KqlConvert.ToStringValue(x), typeof(string))));
+            else
+                terms.Add(ExpressionHelpers.Coerce(c, typeof(string)));
+        }
+        var mi = typeof(KqlFunctions).GetMethod(all ? nameof(KqlFunctions.HasAll) : nameof(KqlFunctions.HasAny))!;
+        return LExpr.Convert(LExpr.Call(mi, ExpressionHelpers.Coerce(Compile(left), typeof(string)),
+            LExpr.NewArrayInit(typeof(string), terms)), typeof(bool?));
+    }
+
+    private LExpr Path(PathExpression path)
+    {
+        var target = Compile(path.Expression);
+        var name = path.Selector switch
+        {
+            NameReference n => n.SimpleName,
+            BracketedExpression { Expression: LiteralExpression l } => l.LiteralValue?.ToString(),
+            _ => null
+        } ?? throw new KqlNotSupportedException("path selector", path.Selector.TextStart);
+        RequiresClient = true;
+        return LExpr.Call(GetMemberMethod, ExpressionHelpers.Coerce(target, typeof(object)), LExpr.Constant(name));
+    }
+
+    private LExpr Element(ElementExpression el)
+    {
+        var target = Compile(el.Expression);
+        var selector = el.Selector is BracketedExpression b ? b.Expression : el.Selector;
+        var index = Compile(selector);
+        RequiresClient = true;
+        return LExpr.Call(GetElementMethod, ExpressionHelpers.Coerce(target, typeof(object)), ExpressionHelpers.Coerce(index, typeof(object)));
+    }
+
+    // ------------------------------------------------------------------ functions
+
+    private LExpr Call(FunctionCallExpression fc)
+    {
+        var name = fc.Name.SimpleName;
+        var symbol = fc.ReferencedSymbol as FunctionSymbol;
+
+        if (_query.IsAggregate(symbol))
+            return Aggregate(fc, name);
+
+        if (symbol is not null && !_query.IsBuiltIn(symbol))
+            return _query.InlineUserFunction(fc, this);
+
+        var args = fc.ArgumentList.Expressions.Select(e => e.Element).ToList();
+
+        switch (name)
+        {
+            case "iff":
+            case "iif":
+            {
+                var rt = KqlTypes.ClrTypeFor(fc.ResultType);
+                return LExpr.Condition(CompilePredicate(args[0]),
+                    ExpressionHelpers.Coerce(Compile(args[1]), rt), ExpressionHelpers.Coerce(Compile(args[2]), rt));
+            }
+            case "case":
+            {
+                var rt = KqlTypes.ClrTypeFor(fc.ResultType);
+                LExpr acc = ExpressionHelpers.Coerce(Compile(args[^1]), rt);
+                for (var i = args.Count - 3; i >= 0; i -= 2)
+                    acc = LExpr.Condition(CompilePredicate(args[i]), ExpressionHelpers.Coerce(Compile(args[i + 1]), rt), acc);
+                return acc;
+            }
+            case "coalesce":
+            {
+                var rt = KqlTypes.ClrTypeFor(fc.ResultType);
+                LExpr acc = ExpressionHelpers.Coerce(Compile(args[^1]), rt);
+                for (var i = args.Count - 2; i >= 0; i--)
+                {
+                    var v = ExpressionHelpers.Coerce(Compile(args[i]), rt);
+                    LExpr present = rt == typeof(string)
+                        ? LExpr.Not(LExpr.Call(typeof(string).GetMethod(nameof(string.IsNullOrEmpty))!, v))
+                        : LExpr.Not(ExpressionHelpers.IsNull(v));
+                    acc = LExpr.Condition(present, v, acc);
+                }
+                return acc;
+            }
+            case "isnull":
+                return LExpr.Convert(ExpressionHelpers.IsNull(Compile(args[0])), typeof(bool?));
+            case "isnotnull":
+                return LExpr.Convert(LExpr.Not(ExpressionHelpers.IsNull(Compile(args[0]))), typeof(bool?));
+            case "isempty":
+            case "isnotempty":
+            {
+                var v = Compile(args[0]);
+                LExpr empty = v.Type == typeof(string)
+                    ? LExpr.Call(typeof(string).GetMethod(nameof(string.IsNullOrEmpty))!, v)
+                    : v.Type == typeof(object)
+                        ? LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.IsEmpty))!, v)
+                        : ExpressionHelpers.IsNull(v);
+                if (name == "isnotempty") empty = LExpr.Not(empty);
+                return LExpr.Convert(empty, typeof(bool?));
+            }
+            case "not":
+                return LExpr.Convert(LExpr.Not(CompilePredicate(args[0])), typeof(bool?));
+            case "pack_all":
+            case "bag_pack_all":
+                return PackAll();
+            case "column_ifexists":
+            {
+                var col = (args[0] as LiteralExpression)?.LiteralValue as string;
+                return col is not null && _schema?.Find(col) is { } c && _row is not null
+                    ? ExpressionHelpers.Coerce(c.Read(_row), KqlTypes.ClrTypeFor(fc.ResultType))
+                    : ExpressionHelpers.Coerce(Compile(args[1]), KqlTypes.ClrTypeFor(fc.ResultType));
+            }
+        }
+
+        return BindFunction(name, args.Select(Compile).ToList(), fc);
+    }
+
+    private LExpr BindFunction(string name, IReadOnlyList<LExpr> args, SyntaxNode at)
+    {
+        var call = FunctionRegistry.TryBind(name, args)
+                   ?? throw new KqlNotSupportedException($"function {name}()", at.TextStart);
+        RequiresClient = true;
+
+        // Constant-fold deterministic calls with constant arguments (e.g. ago(1d)) so providers see a constant.
+        if (!NonDeterministic.Contains(name) && args.All(a => a is ConstantExpression))
+        {
+            var value = LExpr.Lambda(LExpr.Convert(call, typeof(object))).Compile().DynamicInvoke();
+            return LExpr.Constant(value, call.Type);
+        }
+        return call;
+    }
+
+    private LExpr PackAll()
+    {
+        if (_schema is null || _row is null) throw new KqlException("pack_all() requires a row context.");
+        RequiresClient = true;
+        var args = _schema.Columns.SelectMany(c => new[]
+        {
+            (LExpr)LExpr.Constant(c.Name, typeof(object)),
+            LExpr.Convert(c.Read(_row), typeof(object))
+        });
+        return LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.Pack))!, LExpr.NewArrayInit(typeof(object), args));
+    }
+}
