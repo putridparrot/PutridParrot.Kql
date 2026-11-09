@@ -20,14 +20,16 @@ internal sealed partial class QueryCompiler
 {
     private readonly KustoCode _code;
     private readonly IReadOnlyDictionary<string, TableBinding> _tables;
+    private readonly IReadOnlyList<IKqlQueryTranslator> _translators;
     private readonly Dictionary<Symbol, PlanNode> _tabularLets = new();
     private readonly Dictionary<Symbol, LExpr> _scalarLets = new();
     private readonly Stack<Dictionary<string, object>> _parameters = new();
 
-    public QueryCompiler(KustoCode code, IReadOnlyDictionary<string, TableBinding> tables)
+    public QueryCompiler(KustoCode code, IReadOnlyDictionary<string, TableBinding> tables, IReadOnlyList<IKqlQueryTranslator>? translators = null)
     {
         _code = code;
         _tables = tables;
+        _translators = translators ?? [];
     }
 
     private GlobalState Globals => _code.Globals;
@@ -170,8 +172,29 @@ internal sealed partial class QueryCompiler
 
     private PlanNode Table(string name, SyntaxNode at)
     {
-        if (_tables.TryGetValue(name, out var t)) return new SourceNode(t.Schema, t.Source);
+        if (_tables.TryGetValue(name, out var t)) return new SourceNode(t.Schema, t.Source, TranslatorFor(t.Source));
         throw new KqlException($"Table '{name}' is not registered (position {at.TextStart}).");
+    }
+
+    private IKqlQueryTranslator? TranslatorFor(IKqlTableSource source)
+    {
+        if (_translators.Count == 0) return null;
+        var query = source.GetQuery(); // builds the query only; nothing is executed
+        return ExpressionHelpers.IsInMemory(query) ? null : _translators.FirstOrDefault(t => t.CanTranslate(query));
+    }
+
+    /// <summary>
+    /// Builds an operator with the input's translator; if the result still needs in-memory evaluation, rebuilds it
+    /// without the translator so provider-only expressions (e.g. EF.Functions) never run in memory.
+    /// </summary>
+    private OperatorNode Translated(PlanNode input, Func<IKqlQueryTranslator?, OperatorNode> build)
+    {
+        if (input.Translator is { } translator)
+        {
+            var node = build(translator);
+            if (!node.RequiresClient) return node;
+        }
+        return build(null);
     }
 
     private PlanNode InlineTabularFunction(FunctionCallExpression call)

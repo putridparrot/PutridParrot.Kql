@@ -32,23 +32,38 @@ var table = result.ToDataTable();                // or .ToJson(), .AsDictionarie
    produced by `project`, `extend` or `summarize` becomes a runtime-emitted type that has the same form as a C#
    anonymous type, so LINQ providers can translate it.
 3. **Execute**: for in-memory data the expression trees run as LINQ to Objects. For EF Core (or another
-   provider) the query is translated to SQL up to the first operator that needs .NET-only logic, such as `has`;
-   the rest runs in memory.
+   provider) the query is translated to SQL up to the first operator that needs .NET-only logic, such as
+   `matches regex`; the rest runs in memory.
+
+## Entity Framework Core
+
+The core `Kql.Net` package has no EF dependency, and DbSets work with it as they are. For more of KQL to run in
+the database (`contains`, `has`, `=~`, `in~`, `startswith`, `bin()`, `tolower()`, `strlen()`...), add the
+`Kql.Net.EntityFrameworkCore` package:
+
+```csharp
+var kql = new KqlContext()
+    .UseEntityFrameworkCore()
+    .AddTable("Products", db.Products.AsNoTracking());
+```
 
 ```
-Products | where Stock > 0 | summarize Items = count(), Value = sum(Price * Stock) by Category | sort by Value desc
+Products | where Stock > 0 and Name contains "g" | summarize Items = count(), Value = sum(Price * Stock) by Category | sort by Value desc
 ```
 becomes a single SQL statement:
 ```sql
 SELECT "p"."Category", COUNT(*) AS "Items", COALESCE(SUM("p"."Price" * CAST("p"."Stock" AS REAL)), 0.0) AS "Value"
-FROM "Products" AS "p" WHERE CAST("p"."Stock" AS INTEGER) > 0
+FROM "Products" AS "p"
+WHERE CAST("p"."Stock" AS INTEGER) > 0 AND instr(lower("p"."Name"), 'g') > 0
 GROUP BY "p"."Category" ORDER BY COALESCE(SUM(...), 0.0) DESC
 ```
 
-See [docs/coverage.md](docs/coverage.md) for supported operators, functions and sources.
+See [docs/coverage.md](docs/coverage.md) for supported operators, functions, sources and EF translations.
 
 ## Layout
 
-- `src/Kql.Net`: the library
-- `tests/Kql.Net.Tests`: xUnit tests, including EF Core (SQLite) parity tests
+- `src/Kql.Net`: the core library (depends only on Microsoft.Azure.Kusto.Language)
+- `src/Kql.Net.EntityFrameworkCore`: optional EF Core translations
+- `tests/Kql.Net.Tests`: core xUnit tests (no EF)
+- `tests/Kql.Net.EntityFrameworkCore.Tests`: EF Core (SQLite) parity and pushdown tests
 - `samples/Kql.Net.Sample`: console demo (`dotnet run --project samples/Kql.Net.Sample`)

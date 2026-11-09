@@ -93,7 +93,7 @@ internal sealed partial class ScalarCompiler
     private LambdaExpression RowLambda(KExpr body, Func<ScalarCompiler, KExpr, LExpr> compile)
     {
         var p = LExpr.Parameter(_group!.RowSchema.RowType, "r");
-        var inner = new ScalarCompiler(_query, _group.RowSchema, p);
+        var inner = new ScalarCompiler(_query, _group!.RowSchema, p, translator: _translator);
         var lambda = LExpr.Lambda(compile(inner, body), p);
         RequiresClient |= inner.RequiresClient;
         return lambda;
@@ -202,7 +202,7 @@ internal sealed partial class ScalarCompiler
         if (_group is null) throw new KqlException("arg_max/arg_min can only be used in summarize.");
         var rowType = _group.RowSchema.RowType;
         var p = LExpr.Parameter(rowType, "r");
-        var inner = new ScalarCompiler(_query, _group.RowSchema, p);
+        var inner = new ScalarCompiler(_query, _group!.RowSchema, p, translator: _translator);
         var key = inner.Compile(by);
         var value = Nullable(select(inner, p));
         RequiresClient |= inner.RequiresClient;

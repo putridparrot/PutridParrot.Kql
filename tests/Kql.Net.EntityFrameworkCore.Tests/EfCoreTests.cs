@@ -1,7 +1,10 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
-namespace Kql.Net.Tests;
+using Kql.Net.EntityFrameworkCore;
+using Kql.Net.Tests;
+
+namespace Kql.Net.EntityFrameworkCore.Tests;
 
 public sealed class Sale
 {
@@ -23,15 +26,15 @@ public sealed class SalesDb(DbContextOptions<SalesDb> options) : DbContext(optio
 /// Runs the same queries against EF Core (SQLite) and in-memory lists and checks they agree, and that the
 /// translatable parts were pushed down into SQL.
 /// </summary>
-public sealed class EfCoreTests : IDisposable
+public abstract class EfCoreParityTests : IDisposable
 {
     private readonly SqliteConnection _connection = new("DataSource=:memory:");
-    private readonly List<string> _sql = [];
+    protected readonly List<string> _sql = [];
     private readonly SalesDb _db;
-    private readonly KqlContext _efKql;
-    private readonly KqlContext _memKql;
+    protected readonly KqlContext _efKql;
+    protected readonly KqlContext _memKql;
 
-    public EfCoreTests()
+    protected EfCoreParityTests(bool useTranslator)
     {
         _connection.Open();
         var options = new DbContextOptionsBuilder<SalesDb>()
@@ -51,18 +54,19 @@ public sealed class EfCoreTests : IDisposable
         _sql.Clear();
 
         _efKql = new KqlContext().AddTable("Sales", _db.Sales.AsNoTracking());
+        if (useTranslator) _efKql.UseEntityFrameworkCore();
         _memKql = new KqlContext().AddTable("Sales", sales);
     }
 
-    public void Dispose()
+    public virtual void Dispose()
     {
         _db.Dispose();
         _connection.Dispose();
     }
 
-    private string LastSql => string.Join(Environment.NewLine, _sql);
+    protected string LastSql => string.Join(Environment.NewLine, _sql);
 
-    private void AssertSame(string query, bool ordered = true)
+    protected void AssertSame(string query, bool ordered = true)
     {
         var expected = _memKql.Execute(query);
         var actual = _efKql.Execute(query);

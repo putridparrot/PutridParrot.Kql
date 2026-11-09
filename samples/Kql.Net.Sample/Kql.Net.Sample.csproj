@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Kql.Net\Kql.Net.csproj" />
+    <ProjectReference Include="..\..\src\Kql.Net.EntityFrameworkCore\Kql.Net.EntityFrameworkCore.csproj" />
   </ItemGroup>
 
   <ItemGroup>

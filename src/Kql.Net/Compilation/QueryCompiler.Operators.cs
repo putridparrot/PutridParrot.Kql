@@ -93,12 +93,15 @@ internal sealed partial class QueryCompiler
                 q => ExpressionHelpers.ToClientQuery((IEnumerable)run.Invoke(null, [q, fn])!, schema.RowType), name);
         }
 
-        var p = RowParam(input.Schema);
-        var compiler = new ScalarCompiler(this, input.Schema, p);
-        var body = schema.New(values(compiler, p));
-        var lambda = Lambda(body, p);
-        return new OperatorNode(input, schema, compiler.RequiresClient,
-            q => ExpressionHelpers.CallQueryable(q, "Select", [input.Schema.RowType, schema.RowType], LExpr.Quote(lambda)), name);
+        return Translated(input, translator =>
+        {
+            var p = RowParam(input.Schema);
+            var compiler = new ScalarCompiler(this, input.Schema, p, translator: translator);
+            var body = schema.New(values(compiler, p));
+            var lambda = Lambda(body, p);
+            return new OperatorNode(input, schema, compiler.RequiresClient,
+                q => ExpressionHelpers.CallQueryable(q, "Select", [input.Schema.RowType, schema.RowType], LExpr.Quote(lambda)), name);
+        });
     }
 
     private static IReadOnlyList<(string, ScalarSymbol)> Columns(TableSymbol table) =>
@@ -133,11 +136,26 @@ internal sealed partial class QueryCompiler
                 q => ExpressionHelpers.ToClientQuery((IEnumerable)run.Invoke(null, [q, fn])!, input.Schema.RowType), "where");
         }
 
+        if (input.Translator is { } translator)
+        {
+            // Try a fully translated predicate; approximate (superset) translations such as `has` -> LIKE are allowed
+            // here and followed by the exact predicate in memory on the (already reduced) rows.
+            var translated = WhereNode(input, condition, translator);
+            if (!translated.Node.RequiresClient)
+                return translated.Approximate ? WhereNode(translated.Node, condition, null).Node : translated.Node;
+        }
+        return WhereNode(input, condition, null).Node;
+    }
+
+    private (OperatorNode Node, bool Approximate) WhereNode(PlanNode input, KExpr condition, IKqlQueryTranslator? translator)
+    {
         var p = RowParam(input.Schema);
-        var compiler = new ScalarCompiler(this, input.Schema, p);
+        var compiler = new ScalarCompiler(this, input.Schema, p, translator: translator, approximationRoot: translator is null ? null : condition);
         var lambda = Lambda(compiler.CompilePredicate(condition), p);
-        return new OperatorNode(input, input.Schema, compiler.RequiresClient,
+        // with no translator the exact predicate may still be provider-translatable (plain comparisons): keep it pushed down
+        var node = new OperatorNode(input, input.Schema, compiler.RequiresClient,
             q => ExpressionHelpers.CallQueryable(q, "Where", [input.Schema.RowType], LExpr.Quote(lambda)), "where");
+        return (node, compiler.UsedApproximation);
     }
 
     private PlanNode Extend(PlanNode input, IReadOnlyList<KExpr> expressions, TableSymbol output, string name = "extend")
@@ -205,10 +223,13 @@ internal sealed partial class QueryCompiler
 
     private sealed record SortKey(LambdaExpression Key, bool Descending);
 
-    private PlanNode Sort(PlanNode input, IReadOnlyList<KExpr> expressions, string name)
+    private PlanNode Sort(PlanNode input, IReadOnlyList<KExpr> expressions, string name) =>
+        Translated(input, translator => Sort(input, expressions, name, translator));
+
+    private OperatorNode Sort(PlanNode input, IReadOnlyList<KExpr> expressions, string name, IKqlQueryTranslator? translator)
     {
         var p = RowParam(input.Schema);
-        var compiler = new ScalarCompiler(this, input.Schema, p);
+        var compiler = new ScalarCompiler(this, input.Schema, p, translator: translator);
         var keys = new List<SortKey>();
         foreach (var e in expressions)
         {
@@ -253,7 +274,7 @@ internal sealed partial class QueryCompiler
         {
             var count = (long)ExpressionHelpers.ExecuteQueryable(q, "LongCount", [input.Schema.RowType])!;
             return ExpressionHelpers.ToClientQuery(new[] { schema.Constructor!.Invoke([(long?)count]) }.CastTo(schema.RowType), schema.RowType);
-        }, "count");
+        }, "count", keepsProvider: false);
     }
 
     private PlanNode Distinct(PlanNode input, DistinctOperator op, TableSymbol output)
@@ -274,6 +295,12 @@ internal sealed partial class QueryCompiler
         var aggExprs = op.Aggregates.Select(x => x.Element).ToList();
         var widths = AggregateWidths(aggExprs, output.Columns.Count - byExprs.Count, op.TextStart);
 
+        return Translated(input, translator => Summarize(input, byExprs, aggExprs, widths, output, translator));
+    }
+
+    private OperatorNode Summarize(PlanNode input, List<KExpr> byExprs, List<KExpr> aggExprs, int[] widths, TableSymbol output,
+        IKqlQueryTranslator? translator)
+    {
         var outCols = Columns(output);
         var keyCols = outCols.Take(byExprs.Count).ToArray();
         var outSchema = RowSchema.Emit(outCols);
@@ -281,7 +308,7 @@ internal sealed partial class QueryCompiler
 
         // key selector: row => new Key(by...)
         var p = RowParam(input.Schema);
-        var keyCompiler = new ScalarCompiler(this, input.Schema, p);
+        var keyCompiler = new ScalarCompiler(this, input.Schema, p, translator: translator);
         var keyType = byExprs.Count == 0 ? typeof(int) : RowSchema.Emit(keyCols).RowType;
         var keySchema = byExprs.Count == 0 ? null : RowSchema.Emit(keyCols);
         LExpr keyBody = keySchema is null ? LExpr.Constant(1) : keySchema.New(byExprs.Select(keyCompiler.Compile).ToList());
@@ -290,7 +317,7 @@ internal sealed partial class QueryCompiler
         // result selector: g => new Out(g.Key.k..., aggregates...)
         var groupingType = typeof(IGrouping<,>).MakeGenericType(keyType, rowType);
         var g = LExpr.Parameter(groupingType, "g");
-        var aggCompiler = new ScalarCompiler(this, null, null, new GroupContext(g, input.Schema));
+        var aggCompiler = new ScalarCompiler(this, null, null, new GroupContext(g, input.Schema), translator: translator);
         var values = new List<LExpr>();
         if (keySchema is not null)
         {
@@ -336,7 +363,7 @@ internal sealed partial class QueryCompiler
                 rows.Add(resultSelector.Compile().DynamicInvoke(empty)!);
             }
             return ExpressionHelpers.ToClientQuery(rows.CastTo(outSchema.RowType), outSchema.RowType);
-        }, "summarize");
+        }, "summarize", keepsProvider: byExprs.Count > 0 ? null : false);
     }
 
     private static FunctionCallExpression? ArgCall(KExpr aggregate) =>

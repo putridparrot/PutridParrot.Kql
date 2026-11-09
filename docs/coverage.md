@@ -9,6 +9,28 @@ returning wrong results.
 provider-backed. "Memory" means it runs in .NET. The query is pushed down up to the first such operator, and
 the rest of the pipeline runs in memory.
 
+## EF Core translations (`Kql.Net.EntityFrameworkCore`)
+
+The core package has no EF dependency. Plain LINQ already covers comparisons, arithmetic, `and`/`or`, `in`,
+`between`, `iff`, `isnull`/`isempty`, aggregates and `arg_max`. Add the EF package and call
+`kql.UseEntityFrameworkCore()` to have these run in SQL too:
+
+| KQL | SQL form (provider-neutral) | Notes |
+|---|---|---|
+| `contains`, `startswith`, `endswith` (+ negations) | `lower(col)` + `Contains`/`StartsWith`/`EndsWith` | |
+| `contains_cs`, `startswith_cs`, `endswith_cs` | plain string methods | case sensitivity follows the DB collation (SQL Server default is case-insensitive) |
+| `=~`, `!~`, `in~` | `lower(col) = 'x'`, `lower(col) IN (...)` | |
+| `like` | `EF.Functions.Like(lower(col), lower(pattern))` | `like_cs` stays in memory |
+| `has`, `hasprefix`, `hassuffix`, `has_any`, `has_all` (in `where`) | substring prefilter in SQL, exact term match re-checked in memory | only where the result can just widen: under `and`/`or`; `!has` and `not(...)` run in memory |
+| `tolower`, `toupper`, `strlen`, `substring` (constant positions), `strcat` | `lower`, `upper`, `length`, `substr`, `\|\|` | |
+| `abs`, `round(x, n)`, `floor(x)` | `abs`, `round`, `floor` | |
+| `bin(x, n)` for numbers, `bin(dt, 1d)`, `startofday` | `floor(x / n) * n`, date truncation | other time bins (e.g. `1h`) run in memory |
+| `getyear`, `getmonth`, `dayofmonth`, `dayofyear`, `hourofday` | date part functions | |
+
+Anything else, such as `matches regex`, `extract` or `parse`, falls back to memory at that operator. The
+result is the same; only where the work happens changes. Write your own translator by implementing
+`IKqlQueryTranslator` and registering it with `KqlContext.AddTranslator`.
+
 ## Tabular operators
 
 | Operator | Status | Runs in |

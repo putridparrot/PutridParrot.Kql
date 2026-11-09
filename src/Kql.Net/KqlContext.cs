@@ -23,7 +23,23 @@ namespace Kql.Net;
 public sealed class KqlContext
 {
     private readonly Dictionary<string, TableBinding> _tables = new(StringComparer.Ordinal);
+    private readonly List<IKqlQueryTranslator> _translators = [];
     private GlobalState? _globals;
+
+    /// <summary>Registered query translators (see <see cref="AddTranslator"/>).</summary>
+    public IReadOnlyList<IKqlQueryTranslator> Translators => _translators;
+
+    /// <summary>
+    /// Registers a translator that lets a LINQ provider (e.g. EF Core, via the Kql.Net.EntityFrameworkCore package)
+    /// evaluate more KQL operators and functions natively. Without one, provider-backed tables still work, but
+    /// the query moves to in-memory evaluation at the first operator the provider can't translate.
+    /// </summary>
+    public KqlContext AddTranslator(IKqlQueryTranslator translator)
+    {
+        ArgumentNullException.ThrowIfNull(translator);
+        if (!_translators.Contains(translator)) _translators.Add(translator);
+        return this;
+    }
 
     /// <summary>The database name used for the KQL schema (rarely matters).</summary>
     public string DatabaseName { get; init; } = "db";
@@ -116,7 +132,7 @@ public sealed class KqlContext
             .Select(d => new KqlDiagnostic(d.Code, d.Severity, d.Message, d.Start, d.Length))
             .ToList();
         if (errors.Count > 0) throw new KqlException(errors);
-        return new QueryCompiler(code, _tables).Compile();
+        return new QueryCompiler(code, _tables, _translators).Compile();
     }
 
     private static KqlResult Materialize(PlanNode plan)

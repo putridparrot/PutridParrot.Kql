@@ -11,12 +11,20 @@ internal abstract class PlanNode(RowSchema schema)
 {
     public RowSchema Schema { get; } = schema;
 
+    /// <summary>
+    /// The translator for the provider this node's output still belongs to, or null once the pipeline has moved
+    /// to in-memory evaluation (or the source has no translator).
+    /// </summary>
+    public virtual IKqlQueryTranslator? Translator => null;
+
     public abstract IQueryable Execute();
 }
 
 /// <summary>A table registered with the context.</summary>
-internal sealed class SourceNode(RowSchema schema, IKqlTableSource source) : PlanNode(schema)
+internal sealed class SourceNode(RowSchema schema, IKqlTableSource source, IKqlQueryTranslator? translator) : PlanNode(schema)
 {
+    public override IKqlQueryTranslator? Translator => translator;
+
     public override IQueryable Execute() => source.GetQuery();
 }
 
@@ -31,12 +39,19 @@ internal sealed class RowsNode(RowSchema schema, Func<IEnumerable> rows) : PlanN
 /// provider-backed (e.g. EF Core), the input is first materialised so the operator runs in memory —
 /// everything before this point is still translated by the provider.
 /// </summary>
-internal sealed class OperatorNode(PlanNode input, RowSchema schema, bool requiresClient, Func<IQueryable, IQueryable> apply, string name)
+/// <param name="keepsProvider">
+/// False for operators that always produce in-memory output (count, summarize without by...), even though they
+/// can consume a provider-backed input. Defaults to <c>!requiresClient</c>.
+/// </param>
+internal sealed class OperatorNode(PlanNode input, RowSchema schema, bool requiresClient, Func<IQueryable, IQueryable> apply, string name,
+    bool? keepsProvider = null)
     : PlanNode(schema)
 {
     public PlanNode Input { get; } = input;
     public bool RequiresClient { get; } = requiresClient;
     public string Name { get; } = name;
+
+    public override IKqlQueryTranslator? Translator => (keepsProvider ?? !RequiresClient) ? Input.Translator : null;
 
     public override IQueryable Execute()
     {

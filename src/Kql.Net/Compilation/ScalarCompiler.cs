@@ -30,15 +30,54 @@ internal sealed partial class ScalarCompiler
     private readonly LExpr? _row;
     private readonly GroupContext? _group;
     private readonly LExpr? _window;
+    private readonly IKqlQueryTranslator? _translator;
+    private readonly KExpr? _approximationRoot;
 
     /// <param name="window">A <see cref="WindowContext{T}"/> expression when compiling over serialized rows.</param>
-    public ScalarCompiler(QueryCompiler query, RowSchema? schema, LExpr? row, GroupContext? group = null, LExpr? window = null)
+    /// <param name="translator">Provider translator to try before falling back to in-memory helpers.</param>
+    /// <param name="approximationRoot">
+    /// The root of a where predicate: approximate (superset) translations are allowed for sub-expressions reached
+    /// from it only through and / or / parentheses.
+    /// </param>
+    public ScalarCompiler(QueryCompiler query, RowSchema? schema, LExpr? row, GroupContext? group = null, LExpr? window = null,
+        IKqlQueryTranslator? translator = null, KExpr? approximationRoot = null)
     {
         _query = query;
         _schema = schema;
         _row = row;
         _group = group;
         _window = window;
+        _translator = window is null ? translator : null;
+        _approximationRoot = approximationRoot;
+    }
+
+    internal IKqlQueryTranslator? Translator => _translator;
+
+    /// <summary>True when an approximate translation was used, so the exact predicate must be re-applied in memory.</summary>
+    public bool UsedApproximation { get; private set; }
+
+    /// <summary>Asks the translator for a provider form of a string operator; null means "evaluate in memory".</summary>
+    private LExpr? TryTranslate(KqlStringOperator op, bool caseSensitive, LExpr left, LExpr right, SyntaxNode at, bool negate)
+    {
+        if (_translator?.TranslateStringOperator(op, caseSensitive, left, right) is not { } t) return null;
+        if (t.IsApproximate)
+        {
+            if (negate || !ApproximationAllowed(at)) return null;
+            UsedApproximation = true;
+        }
+        return t.Expression;
+    }
+
+    private bool ApproximationAllowed(SyntaxNode node)
+    {
+        if (_approximationRoot is null) return false;
+        for (var n = node; n != _approximationRoot; n = n.Parent)
+        {
+            if (n.Parent is null) return false;
+            if (n.Parent is not (ParenthesizedExpression or BinaryExpression { Kind: SyntaxKind.AndExpression or SyntaxKind.OrExpression }))
+                return false;
+        }
+        return true;
     }
 
     /// <summary>Names of KQL window functions, which need serialized input.</summary>
@@ -92,9 +131,9 @@ internal sealed partial class ScalarCompiler
             case BetweenExpression be:
                 return Between(be);
             case HasAnyExpression ha:
-                return HasAnyAll(ha.Left, ha.Right, all: false);
+                return HasAnyAll(ha, ha.Left, ha.Right, all: false);
             case HasAllExpression hl:
-                return HasAnyAll(hl.Left, hl.Right, all: true);
+                return HasAnyAll(hl, hl.Left, hl.Right, all: true);
             case PathExpression path:
                 return Path(path);
             case ElementExpression el:
@@ -251,6 +290,9 @@ internal sealed partial class ScalarCompiler
             ExpressionHelpers.Coerce(Compile(b.Left), typeof(string)),
             ExpressionHelpers.Coerce(Compile(b.Right), typeof(string))
         };
+        if (TryTranslate(System.Enum.Parse<KqlStringOperator>(method), caseSensitive ?? false, args[0], args[1], b, negate) is { } translated)
+            return LExpr.Convert(negate ? LExpr.Not(translated) : translated, typeof(bool?));
+
         if (caseSensitive is { } cs) args.Add(LExpr.Constant(cs));
         var mi = typeof(KqlFunctions).GetMethod(method, args.Select(a => a.Type).ToArray())!;
         RequiresClient = true;
@@ -312,8 +354,12 @@ internal sealed partial class ScalarCompiler
         LExpr result;
         if (left.Type == typeof(string) && op is not (ExpressionType.Equal or ExpressionType.NotEqual))
         {
-            RequiresClient = true;
-            var cmp = LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.CompareOrdinal))!, left, right);
+            var cmp = TryTranslate(KqlStringOperator.Compare, true, left, right, b, false);
+            if (cmp is null)
+            {
+                RequiresClient = true;
+                cmp = LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.CompareOrdinal))!, left, right);
+            }
             result = LExpr.MakeBinary(op, cmp, LExpr.Constant(0));
         }
         else if (left.Type == typeof(object))
@@ -386,11 +432,13 @@ internal sealed partial class ScalarCompiler
         LExpr result;
         if (caseInsensitive)
         {
-            RequiresClient = true;
             var all = items.Select(i => (LExpr)LExpr.Constant(KqlConvert.ToStringValue(i), typeof(string)))
                 .Concat(exprs.Select(e => ExpressionHelpers.Coerce(e, typeof(string))));
-            result = LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.InIgnoreCase))!,
-                ExpressionHelpers.Coerce(left, typeof(string)), LExpr.NewArrayInit(typeof(string), all));
+            var stringLeft = ExpressionHelpers.Coerce(left, typeof(string));
+            var array = LExpr.NewArrayInit(typeof(string), all);
+            var translated = TryTranslate(KqlStringOperator.InIgnoreCase, false, stringLeft, array, ie, negate);
+            if (translated is null) RequiresClient = true;
+            result = translated ?? LExpr.Call(typeof(KqlFunctions).GetMethod(nameof(KqlFunctions.InIgnoreCase))!, stringLeft, array);
         }
         else
         {
@@ -432,9 +480,8 @@ internal sealed partial class ScalarCompiler
         return LExpr.Convert(result, typeof(bool?));
     }
 
-    private LExpr HasAnyAll(KExpr left, ExpressionList right, bool all)
+    private LExpr HasAnyAll(KExpr node, KExpr left, ExpressionList right, bool all)
     {
-        RequiresClient = true;
         var terms = new List<LExpr>();
         foreach (var se in right.Expressions)
         {
@@ -444,9 +491,14 @@ internal sealed partial class ScalarCompiler
             else
                 terms.Add(ExpressionHelpers.Coerce(c, typeof(string)));
         }
+        var stringLeft = ExpressionHelpers.Coerce(Compile(left), typeof(string));
+        var array = LExpr.NewArrayInit(typeof(string), terms);
+        if (TryTranslate(all ? KqlStringOperator.HasAll : KqlStringOperator.HasAny, false, stringLeft, array, node, false) is { } translated)
+            return LExpr.Convert(translated, typeof(bool?));
+
+        RequiresClient = true;
         var mi = typeof(KqlFunctions).GetMethod(all ? nameof(KqlFunctions.HasAll) : nameof(KqlFunctions.HasAny))!;
-        return LExpr.Convert(LExpr.Call(mi, ExpressionHelpers.Coerce(Compile(left), typeof(string)),
-            LExpr.NewArrayInit(typeof(string), terms)), typeof(bool?));
+        return LExpr.Convert(LExpr.Call(mi, stringLeft, array), typeof(bool?));
     }
 
     private LExpr Path(PathExpression path)
@@ -555,17 +607,21 @@ internal sealed partial class ScalarCompiler
 
     private LExpr BindFunction(string name, IReadOnlyList<LExpr> args, SyntaxNode at)
     {
-        var call = FunctionRegistry.TryBind(name, args)
-                   ?? throw new KqlNotSupportedException($"function {name}()", at.TextStart);
-        RequiresClient = true;
+        var call = FunctionRegistry.TryBind(name, args);
 
         // Constant-fold deterministic calls with constant arguments (e.g. ago(1d)) so providers see a constant.
-        if (!NonDeterministic.Contains(name) && args.All(a => a is ConstantExpression))
+        if (call is not null && !NonDeterministic.Contains(name) && args.All(a => a is ConstantExpression))
         {
             var value = LExpr.Lambda(LExpr.Convert(call, typeof(object))).Compile().DynamicInvoke();
             return LExpr.Constant(value, call.Type);
         }
-        return call;
+
+        var resultType = at is KExpr { ResultType: ScalarSymbol rt } ? KqlTypes.ClrTypeFor(rt) : call?.Type ?? typeof(object);
+        if (_translator?.TranslateFunction(name, args, resultType) is { IsApproximate: false } translated)
+            return ExpressionHelpers.Coerce(translated.Expression, resultType);
+
+        RequiresClient = true;
+        return call ?? throw new KqlNotSupportedException($"function {name}()", at.TextStart);
     }
 
     private LExpr Window(string name, List<KExpr> args, SyntaxNode at)

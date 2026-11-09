@@ -1,4 +1,5 @@
 ﻿using Kql.Net;
+using Kql.Net.EntityFrameworkCore;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
@@ -55,10 +56,10 @@ using (var seed = new ShopDb(new DbContextOptionsBuilder<ShopDb>().UseSqlite(con
 }
 
 using var db = new ShopDb(options);
-var dbKql = new KqlContext().AddTable("Products", db.Products.AsNoTracking());
+var dbKql = new KqlContext().UseEntityFrameworkCore().AddTable("Products", db.Products.AsNoTracking());
 Run("EF Core: in-stock value by category (translated to SQL)", """
     Products
-    | where Stock > 0
+    | where Stock > 0 and Name contains "g"
     | summarize Items = count(), StockValue = sum(Price * Stock) by Category
     | sort by StockValue desc
     """, dbKql);
