@@ -20,7 +20,7 @@ internal sealed partial class QueryCompiler
             case FilterOperator f:
                 return Where(input, f.Condition);
             case ExtendOperator e:
-                return Extend(input, e, output!);
+                return Extend(input, e.Expressions.Select(x => x.Element).ToList(), output!);
             case ProjectOperator p:
                 return Project(input, p.Expressions.Select(x => x.Element).ToList(), output!, "project");
             case ProjectAwayOperator:
@@ -50,9 +50,11 @@ internal sealed partial class QueryCompiler
             case MvExpandOperator mv:
                 return MvExpand(input, mv, output!);
             case ParseOperator parse:
-                return Parse(input, parse, output!);
+                return Parse(input, parse.Expression, parse.Parameters, parse.Patterns, output!, whereOnly: false);
+            case ParseWhereOperator parseWhere:
+                return Parse(input, parseWhere.Expression, parseWhere.Parameters, parseWhere.Patterns, output!, whereOnly: true);
             case SerializeOperator ser:
-                return ser.Expressions.Count == 0 ? input : Serialize(input, ser, output!);
+                return ser.Expressions.Count == 0 ? input : Extend(input, ser.Expressions.Select(x => x.Element).ToList(), output!, "serialize");
             case AsOperator:
             case ConsumeOperator:
                 return input;
@@ -76,9 +78,21 @@ internal sealed partial class QueryCompiler
     /// and returns the value expression for each output column.
     /// </summary>
     private OperatorNode Select(PlanNode input, IReadOnlyList<(string Name, ScalarSymbol Type)> columns,
-        Func<ScalarCompiler, ParameterExpression, IReadOnlyList<LExpr>> values, string name)
+        Func<ScalarCompiler, LExpr, IReadOnlyList<LExpr>> values, string name, IEnumerable<SyntaxNode>? syntax = null)
     {
         var schema = RowSchema.Emit(columns);
+        if (UsesWindowFunctions(syntax))
+        {
+            // window functions: evaluate row by row over the materialised, ordered input
+            var (ctx, ctxType) = WindowParam(input);
+            var row = LExpr.Property(ctx, "Current");
+            var windowCompiler = new ScalarCompiler(this, input.Schema, row, window: ctx);
+            var fn = LExpr.Lambda(typeof(Func<,>).MakeGenericType(ctxType, schema.RowType), schema.New(values(windowCompiler, row)), ctx).Compile();
+            var run = ctxType.GetMethod("Select")!.MakeGenericMethod(schema.RowType);
+            return new OperatorNode(input, schema, true,
+                q => ExpressionHelpers.ToClientQuery((IEnumerable)run.Invoke(null, [q, fn])!, schema.RowType), name);
+        }
+
         var p = RowParam(input.Schema);
         var compiler = new ScalarCompiler(this, input.Schema, p);
         var body = schema.New(values(compiler, p));
@@ -90,10 +104,35 @@ internal sealed partial class QueryCompiler
     private static IReadOnlyList<(string, ScalarSymbol)> Columns(TableSymbol table) =>
         table.Columns.Select(c => (c.Name, RowSchema.AsScalar(c.Type))).ToArray();
 
+    private static bool UsesWindowFunctions(IEnumerable<SyntaxNode>? nodes)
+    {
+        if (nodes is null) return false;
+        var found = false;
+        foreach (var node in nodes)
+            node.WalkElements(e => found |= e is FunctionCallExpression fc && ScalarCompiler.WindowFunctions.Contains(fc.Name.SimpleName));
+        return found;
+    }
+
+    private static (ParameterExpression Ctx, Type CtxType) WindowParam(PlanNode input)
+    {
+        var ctxType = typeof(WindowContext<>).MakeGenericType(input.Schema.RowType);
+        return (LExpr.Parameter(ctxType, "w"), ctxType);
+    }
+
     // ------------------------------------------------------------------ where / extend / project
 
     private PlanNode Where(PlanNode input, KExpr condition)
     {
+        if (UsesWindowFunctions([condition]))
+        {
+            var (ctx, ctxType) = WindowParam(input);
+            var windowCompiler = new ScalarCompiler(this, input.Schema, LExpr.Property(ctx, "Current"), window: ctx);
+            var fn = LExpr.Lambda(typeof(Func<,>).MakeGenericType(ctxType, typeof(bool)), windowCompiler.CompilePredicate(condition), ctx).Compile();
+            var run = ctxType.GetMethod("Where")!;
+            return new OperatorNode(input, input.Schema, true,
+                q => ExpressionHelpers.ToClientQuery((IEnumerable)run.Invoke(null, [q, fn])!, input.Schema.RowType), "where");
+        }
+
         var p = RowParam(input.Schema);
         var compiler = new ScalarCompiler(this, input.Schema, p);
         var lambda = Lambda(compiler.CompilePredicate(condition), p);
@@ -101,11 +140,11 @@ internal sealed partial class QueryCompiler
             q => ExpressionHelpers.CallQueryable(q, "Where", [input.Schema.RowType], LExpr.Quote(lambda)), "where");
     }
 
-    private PlanNode Extend(PlanNode input, ExtendOperator op, TableSymbol output)
+    private PlanNode Extend(PlanNode input, IReadOnlyList<KExpr> expressions, TableSymbol output, string name = "extend")
     {
         var assigned = new Dictionary<string, KExpr>(StringComparer.Ordinal);
         var unnamed = new Queue<KExpr>();
-        foreach (var e in op.Expressions.Select(x => x.Element))
+        foreach (var e in expressions)
         {
             if (e is SimpleNamedExpression sn) assigned[sn.Name.SimpleName] = sn.Expression;
             else if (e is CompoundNamedExpression) throw new KqlNotSupportedException("tuple assignment in extend", e.TextStart);
@@ -119,7 +158,8 @@ internal sealed partial class QueryCompiler
         }
 
         return Select(input, Columns(output), (compiler, row) => output.Columns.Select(c =>
-            assigned.TryGetValue(c.Name, out var expr) ? compiler.Compile(expr) : compiler.Read(input.Schema.Get(c.Name), row)).ToList(), "extend");
+            assigned.TryGetValue(c.Name, out var expr) ? compiler.Compile(expr) : compiler.Read(input.Schema.Get(c.Name), row)).ToList(),
+            name, expressions);
     }
 
     private PlanNode Project(PlanNode input, IReadOnlyList<KExpr> expressions, TableSymbol output, string name)
@@ -131,7 +171,7 @@ internal sealed partial class QueryCompiler
                 return Reshape(input, output, RenameMap(expressions), name);
             throw new KqlNotSupportedException($"{name} with wildcard or tuple expressions", expressions.FirstOrDefault()?.TextStart ?? 0);
         }
-        return Select(input, Columns(output), (compiler, _) => expressions.Select(compiler.Compile).ToList(), name);
+        return Select(input, Columns(output), (compiler, _) => expressions.Select(compiler.Compile).ToList(), name, expressions);
     }
 
     /// <summary>new name -> old name for `new = old` pairs.</summary>
@@ -232,8 +272,7 @@ internal sealed partial class QueryCompiler
     {
         var byExprs = op.ByClause?.Expressions.Select(x => x.Element).ToList() ?? [];
         var aggExprs = op.Aggregates.Select(x => x.Element).ToList();
-        if (byExprs.Count + aggExprs.Count != output.Columns.Count)
-            throw new KqlNotSupportedException("summarize with multi-column aggregates (e.g. arg_max)", op.TextStart);
+        var widths = AggregateWidths(aggExprs, output.Columns.Count - byExprs.Count, op.TextStart);
 
         var outCols = Columns(output);
         var keyCols = outCols.Take(byExprs.Count).ToArray();
@@ -258,7 +297,28 @@ internal sealed partial class QueryCompiler
             var key = LExpr.Property(g, "Key");
             values.AddRange(keySchema.Columns.Select(c => c.Read(key)));
         }
-        values.AddRange(aggExprs.Select(aggCompiler.Compile));
+        var column = byExprs.Count;
+        for (var i = 0; i < aggExprs.Count; i++)
+        {
+            values.Add(aggCompiler.Compile(aggExprs[i]));
+            if (widths[i] > 1 && ArgCall(aggExprs[i]) is { } arg)
+            {
+                // arg_max/arg_min extra columns: values from the same (max/min) row
+                var args = arg.ArgumentList.Expressions.Select(x => x.Element).ToList();
+                var max = arg.Name.SimpleName == "arg_max";
+                var star = args.Skip(1).Any(a => a is StarExpression);
+                for (var k = 1; k < widths[i]; k++)
+                {
+                    var name = outCols[column + k].Item1;
+                    var expr = star ? null : args[k];
+                    var col = star ? input.Schema.Find(name)
+                                     ?? throw new KqlNotSupportedException($"arg_max/arg_min column '{name}'", arg.TextStart)
+                                   : null;
+                    values.Add(aggCompiler.ArgValue(args[0], max, (c, r) => col is not null ? c.Read(col, r) : c.Compile(expr!)));
+                }
+            }
+            column += widths[i];
+        }
         var resultSelector = LExpr.Lambda(outSchema.New(values), g);
 
         var requiresClient = keyCompiler.RequiresClient || aggCompiler.RequiresClient;
@@ -277,6 +337,43 @@ internal sealed partial class QueryCompiler
             }
             return ExpressionHelpers.ToClientQuery(rows.CastTo(outSchema.RowType), outSchema.RowType);
         }, "summarize");
+    }
+
+    private static FunctionCallExpression? ArgCall(KExpr aggregate) =>
+        (aggregate is SimpleNamedExpression sn ? sn.Expression : aggregate) is FunctionCallExpression { Name.SimpleName: "arg_max" or "arg_min" } fc
+            ? fc
+            : null;
+
+    /// <summary>
+    /// Number of output columns each aggregate produces: 1, or for arg_max/arg_min 1 + the selected columns
+    /// (`*` takes whatever output columns remain).
+    /// </summary>
+    private static int[] AggregateWidths(IReadOnlyList<KExpr> aggregates, int available, int position)
+    {
+        var widths = new int[aggregates.Count];
+        var starIndex = -1;
+        for (var i = 0; i < aggregates.Count; i++)
+        {
+            if (ArgCall(aggregates[i]) is { } arg)
+            {
+                var args = arg.ArgumentList.Expressions.Select(x => x.Element).ToList();
+                if (args.Skip(1).Any(a => a is StarExpression))
+                {
+                    if (starIndex >= 0) throw new KqlNotSupportedException("several arg_max/arg_min(…, *) in one summarize", position);
+                    starIndex = i;
+                    continue;
+                }
+                widths[i] = args.Count;
+            }
+            else
+            {
+                widths[i] = 1;
+            }
+        }
+        if (starIndex >= 0) widths[starIndex] = available - widths.Sum();
+        if (widths.Sum() != available || widths.Any(w => w < 1))
+            throw new KqlNotSupportedException("summarize output shape", position);
+        return widths;
     }
 
     // ------------------------------------------------------------------ getschema

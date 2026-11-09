@@ -26,10 +26,12 @@ the rest of the pipeline runs in memory.
 | `lookup` (leftouter/inner) | ✅ | Memory |
 | `union` (incl. `withsource=`, outer schema) | ✅ | SQL if all inputs share a provider |
 | `let` (scalar, tabular, user-defined scalar and tabular functions), `toscalar()`, `materialize()` | ✅ | n/a |
-| `print`, `range`, `datatable`, `getschema`, `as`, `serialize` (no expressions) | ✅ | Memory |
+| `print`, `range`, `datatable`, `getschema`, `as` | ✅ | Memory |
+| `serialize` (with or without expressions) | ✅ | Memory when it has expressions |
+| `mv-expand` (multiple columns, `to typeof()`, `with_itemindex`, `bagexpansion`, `limit`) | ✅ | Memory |
+| `parse` / `parse-where` (`kind=simple`, `relaxed`, `regex`, `flags=`) | ✅ | Memory |
 | Multiple statements (`ExecuteAll`) | ✅ | n/a |
-| `mv-expand`, `mv-apply`, `parse`, `parse-kv`, `serialize` with window functions, `top-nested`, `make-series` | ⏳ Phase 5 | |
-| `arg_max` / `arg_min` (multi-column aggregates) | ⏳ Phase 2 follow-up | |
+| `mv-apply`, `parse-kv`, `top-nested`, `make-series` | ⏳ | |
 | `render`, `evaluate` plugins, graph operators, `find`, `search`, `fork`, `facet`, cross-cluster/database | ❌ out of scope for now | |
 
 ## Scalar operators
@@ -50,6 +52,7 @@ negated), `like`, `matches regex`, `in`/`!in`/`in~` (literal lists, dynamic arra
 | Datetime | `now`, `ago`, `startof/endof day/week/month/year`, `getyear`, `getmonth`/`monthofyear`, `dayofmonth`, `dayofyear`, `dayofweek`, `hourofday`, `week_of_year`, `datetime_add`, `datetime_diff`, `datetime_part`, `format_datetime`, `format_timespan`, `make_datetime`, `make_timespan`, `unixtime_*_todatetime` |
 | Dynamic | `array_length`, `pack_array`, `pack`/`bag_pack`, `pack_all`, `bag_keys`, `array_concat`, `array_index_of`, `set_has_element`, `array_sum`, `gettype` |
 | Misc | `new_guid`, `hash` |
+| Window (need serialized input: after `sort`/`order`/`serialize`) | `row_number` (with start/restart), `prev`, `next` (offset, default), `row_cumsum` (restart), `row_rank_dense`, `row_rank_min`. Operators using them run in memory |
 
 Deterministic calls with constant arguments (e.g. `ago(1d)`) are evaluated once at compile time, so a provider
 sees a constant. Register more functions with `FunctionRegistry.Register(typeof(MyFunctions))`, using static
@@ -59,7 +62,11 @@ methods marked `[KqlFunction("name")]`.
 
 `count`, `countif`, `sum`, `sumif`, `avg`, `avgif`, `min`, `max`, `minif`, `maxif`, `dcount`/`count_distinct`,
 `dcountif`, `take_any`/`any`, `take_anyif`, `make_list`, `make_list_if`, `make_list_with_nulls`, `make_set`,
-`make_set_if`, `make_bag`, `stdev`, `stdevp`, `variance`, `variancep`, `percentile` (nearest rank).
+`make_set_if`, `make_bag`, `stdev`, `stdevp`, `variance`, `variancep`, `percentile` (nearest rank),
+`arg_max` / `arg_min` (explicit columns or `*`; rows with a null key are ignored).
+
+`arg_max`/`arg_min` translate to SQL as one correlated subquery per output column. That is correct, but
+`arg_max(x, *)` on a wide table produces many subqueries.
 
 ## Sources
 

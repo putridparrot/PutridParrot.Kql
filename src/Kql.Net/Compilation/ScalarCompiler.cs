@@ -29,14 +29,25 @@ internal sealed partial class ScalarCompiler
     private readonly RowSchema? _schema;
     private readonly LExpr? _row;
     private readonly GroupContext? _group;
+    private readonly LExpr? _window;
 
-    public ScalarCompiler(QueryCompiler query, RowSchema? schema, LExpr? row, GroupContext? group = null)
+    /// <param name="window">A <see cref="WindowContext{T}"/> expression when compiling over serialized rows.</param>
+    public ScalarCompiler(QueryCompiler query, RowSchema? schema, LExpr? row, GroupContext? group = null, LExpr? window = null)
     {
         _query = query;
         _schema = schema;
         _row = row;
         _group = group;
+        _window = window;
     }
+
+    /// <summary>Names of KQL window functions, which need serialized input.</summary>
+    internal static readonly HashSet<string> WindowFunctions = new(StringComparer.Ordinal)
+    {
+        "row_number", "prev", "next", "row_cumsum", "row_rank_dense", "row_rank_min"
+    };
+
+    private static int _windowSite;
 
     /// <summary>True when the compiled expression needs in-memory (client) evaluation.</summary>
     public bool RequiresClient { get; private set; }
@@ -110,6 +121,8 @@ internal sealed partial class ScalarCompiler
             return d;
         }),
         JsonArrayExpression a => a.Values.Select(v => JsonLiteral(v.Element)).ToList(),
+        LiteralExpression { Kind: SyntaxKind.NullLiteralExpression } => null,
+        LiteralExpression { Token.Kind: SyntaxKind.NullKeyword } => null,
         LiteralExpression l => Dynamic.Normalize(l.LiteralValue),
         _ => Dynamic.Normalize(_query.EvaluateScalar(e))
     };
@@ -473,6 +486,9 @@ internal sealed partial class ScalarCompiler
 
         var args = fc.ArgumentList.Expressions.Select(e => e.Element).ToList();
 
+        if (WindowFunctions.Contains(name))
+            return Window(name, args, fc);
+
         switch (name)
         {
             case "iff":
@@ -550,6 +566,49 @@ internal sealed partial class ScalarCompiler
             return LExpr.Constant(value, call.Type);
         }
         return call;
+    }
+
+    private LExpr Window(string name, List<KExpr> args, SyntaxNode at)
+    {
+        if (_window is null)
+            throw new KqlException($"{name}() requires serialized input: use sort/order/serialize first (position {at.TextStart}).");
+        RequiresClient = true;
+        var site = LExpr.Constant(Interlocked.Increment(ref _windowSite));
+
+        LExpr Restart(int index) => args.Count > index ? CompilePredicate(args[index]) : LExpr.Constant(false);
+
+        switch (name)
+        {
+            case "prev":
+            case "next":
+            {
+                var offset = args.Count > 1 ? KqlConvert.ToLong(_query.EvaluateScalar(args[1])) ?? 1 : 1;
+                var off = LExpr.Constant((int)(name == "prev" ? -offset : offset));
+                var other = new ScalarCompiler(_query, _schema, LExpr.Call(_window, "At", null, off), _group, _window);
+                var value = Nullable(other.Compile(args[0]));
+                RequiresClient |= other.RequiresClient;
+                var fallback = args.Count > 2 ? ExpressionHelpers.Coerce(Compile(args[2]), value.Type) : LExpr.Constant(null, value.Type);
+                return LExpr.Condition(LExpr.Call(_window, "Has", null, off), value, fallback);
+            }
+            case "row_number":
+            {
+                var start = args.Count > 0 ? ExpressionHelpers.Coerce(Compile(args[0]), typeof(long?)) : LExpr.Constant(1L, typeof(long?));
+                return LExpr.Call(_window, "RowNumber", null, site, start, Restart(1));
+            }
+            case "row_cumsum":
+            {
+                var value = Compile(args[0]);
+                var (method, type) = value.Type == typeof(decimal?) ? ("CumSumDecimal", typeof(decimal?))
+                    : value.Type == typeof(double?) ? ("CumSumDouble", typeof(double?))
+                    : ("CumSumLong", typeof(long?));
+                return LExpr.Call(_window, method, null, site, ExpressionHelpers.Coerce(value, type), Restart(1));
+            }
+            default: // row_rank_dense / row_rank_min
+            {
+                var value = ExpressionHelpers.Coerce(Compile(args[0]), typeof(object));
+                return LExpr.Call(_window, name == "row_rank_dense" ? "RankDense" : "RankMin", null, site, value, Restart(1));
+            }
+        }
     }
 
     private LExpr PackAll()

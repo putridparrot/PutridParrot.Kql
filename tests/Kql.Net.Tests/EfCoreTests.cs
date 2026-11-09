@@ -144,6 +144,21 @@ public sealed class EfCoreTests : IDisposable
     }
 
     [Fact]
+    public void ArgMax()
+    {
+        AssertSame("Sales | summarize arg_max(Amount, Id, Customer) by Region | sort by Region asc");
+        AssertSame("Sales | summarize arg_min(Timestamp, *) by Customer | sort by Customer asc");
+    }
+
+    [Fact]
+    public void WindowFunctions_And_RowOperators()
+    {
+        AssertSame("Sales | where Region == 'US' | sort by Id asc | extend rn = row_number(), p = prev(Amount) | project Id, rn, p");
+        AssertSame("Sales | where Quantity > 1 | parse Customer with who:string | project Id, who | sort by Id asc");
+        Assert.Contains("WHERE", LastSql);
+    }
+
+    [Fact]
     public void Join_EfWithInMemory()
     {
         _efKql.AddTable("Customers", TestData.Customers());

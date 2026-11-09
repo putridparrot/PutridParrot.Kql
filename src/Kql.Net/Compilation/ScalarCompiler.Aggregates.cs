@@ -78,6 +78,10 @@ internal sealed partial class ScalarCompiler
                 return Helper(nameof(KqlAggregates.VarianceP), g, args[0]);
             case "percentile":
                 return Helper(nameof(KqlAggregates.Percentile), g, args[0], Compile(args[1]));
+            case "arg_max":
+            case "arg_min":
+                // the first output column is the extreme value itself; Summarize adds the other columns
+                return ArgValue(args[0], name == "arg_max", (c, _) => c.Compile(args[0]));
             case "make_bag":
                 return Helper(nameof(KqlAggregates.MakeBag), g, args[0], MaxSize(args, 1));
             default:
@@ -186,6 +190,29 @@ internal sealed partial class ScalarCompiler
         var rowType = _group!.RowSchema.RowType;
         var selected = Enum("Select", [rowType, selector.ReturnType], g, selector);
         return Enum("FirstOrDefault", [selector.ReturnType], selected);
+    }
+
+    /// <summary>
+    /// Value of <paramref name="select"/> on the row of the group with the max (or min) of <paramref name="by"/>,
+    /// ignoring rows where <paramref name="by"/> is null:
+    /// <c>g.Where(r =&gt; by(r) != null).OrderByDescending(by).Select(select).FirstOrDefault()</c>.
+    /// </summary>
+    internal LExpr ArgValue(KExpr by, bool max, Func<ScalarCompiler, ParameterExpression, LExpr> select)
+    {
+        if (_group is null) throw new KqlException("arg_max/arg_min can only be used in summarize.");
+        var rowType = _group.RowSchema.RowType;
+        var p = LExpr.Parameter(rowType, "r");
+        var inner = new ScalarCompiler(_query, _group.RowSchema, p);
+        var key = inner.Compile(by);
+        var value = Nullable(select(inner, p));
+        RequiresClient |= inner.RequiresClient;
+        if (key.Type == typeof(object))
+            throw new KqlNotSupportedException("arg_max/arg_min over a dynamic value", by.TextStart);
+
+        var filtered = Enum("Where", [rowType], _group.Group, LExpr.Lambda(LExpr.Not(ExpressionHelpers.IsNull(key)), p));
+        var ordered = Enum(max ? "OrderByDescending" : "OrderBy", [rowType, key.Type], filtered, LExpr.Lambda(key, p));
+        var selected = Enum("Select", [rowType, value.Type], ordered, LExpr.Lambda(value, p));
+        return Enum("FirstOrDefault", [value.Type], selected);
     }
 
     private LExpr MaxSize(List<KExpr> args, int index) =>
