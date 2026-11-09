@@ -44,8 +44,8 @@ result is the same; only where the work happens changes. Write your own translat
 | `count` | ✅ | SQL |
 | `distinct` (columns or `*`) | ✅ | SQL |
 | `summarize … by …` | ✅ | SQL for count/sum/avg/min/max/countif/sumif/dcount; memory for the rest |
-| `join` (all 9 kinds, `on col`, `on $left.a == $right.b`) | ✅ | Memory |
-| `lookup` (leftouter/inner) | ✅ | Memory |
+| `join` (all 9 kinds, `on col`, `on $left.a == $right.b`) | ✅ | SQL when both sides come from the same provider (e.g. one `DbContext`), except `fullouter`; memory otherwise |
+| `lookup` (leftouter/inner) | ✅ | SQL / memory as for `join` |
 | `union` (incl. `withsource=`, outer schema) | ✅ | SQL if all inputs share a provider |
 | `let` (scalar, tabular, user-defined scalar and tabular functions), `toscalar()`, `materialize()` | ✅ | n/a |
 | `print`, `range`, `datatable`, `getschema`, `as` | ✅ | Memory |
@@ -77,8 +77,30 @@ negated), `like`, `matches regex`, `in`/`!in`/`in~` (literal lists, dynamic arra
 | Window (need serialized input: after `sort`/`order`/`serialize`) | `row_number` (with start/restart), `prev`, `next` (offset, default), `row_cumsum` (restart), `row_rank_dense`, `row_rank_min`. Operators using them run in memory |
 
 Deterministic calls with constant arguments (e.g. `ago(1d)`) are evaluated once at compile time, so a provider
-sees a constant. Register more functions with `FunctionRegistry.Register(typeof(MyFunctions))`, using static
-methods marked `[KqlFunction("name")]`.
+sees a constant.
+
+### Custom functions
+
+Custom functions are registered per `KqlContext` and declared to the parser, so new names type-check like built-ins:
+
+```csharp
+var kql = new KqlContext()
+    .AddFunction("double_it", (long? x) => x * 2)       // lambdas and closures
+    .AddFunctions(typeof(MyFunctions));                  // static methods marked [KqlFunction("name")]
+```
+
+Using a built-in name replaces that function's implementation in this context only. Custom functions run in
+memory.
+
+## Null semantics
+
+- **`==` and `!=`:** never true when either side is null (`null == null` is false), and the same goes for
+  `!in`. Use `isnull()`/`isnotnull()` to test for nulls. `<`, `>` and the other orderings are also false with null.
+  A comparison that involves null gives `false` rather than KQL's `null`; `where` treats the two the same.
+- **Strings:** KQL strings are never null, so a null .NET string behaves as `""` (`Notes == ''` matches null
+  `Notes`).
+- **`join` / `lookup`:** keys that are null never match, but the row still appears unmatched in outer and anti joins.
+- **`summarize … by`:** groups null keys together.
 
 ## Aggregates
 
@@ -101,5 +123,14 @@ methods marked `[KqlFunction("name")]`.
 | `DataTable` | `AddTable("T", dataTable)` |
 | JSON array of objects | `AddJsonTable("T", json)` |
 | `IQueryable<T>` (EF Core `DbSet`, any LINQ provider) | `AddTable("T", db.Things)`: translated where possible |
+| CSV | `AddCsvTable("T", path, options)` or `AddTable("T", CsvTableSource.FromText(csv))`. Handles quoted fields, embedded commas and newlines, and custom delimiters. Types are inferred (long, real, bool, datetime, timespan, guid, string) or set explicitly; the file is re-read on each query |
+| `IAsyncEnumerable<T>` | `AddTable("T", asyncRows)`, enumerated on each query, so it must be re-enumerable |
 | Custom | implement `IKqlTableSource` |
-| CSV, Redis, `IAsyncEnumerable` | ⏳ Phase 6 |
+| Redis (`Kql.Net.Redis` package) | `AddRedisStrings`, `AddRedisHashes`, `AddRedisJson` (RedisJSON) and `AddRedisStream`. Keys are found with SCAN and values fetched in pipelined batches; the schema is inferred from a sample and data is read on each query. Operators run in memory |
+
+## Async results
+
+- `ExecuteAsync(query)` returns a `KqlResult`. It reads EF Core queries with EF's own async enumeration.
+- `StreamAsync(query)` yields rows as they're produced. Operators that need all their input (sort, summarize,
+  in-memory joins) still buffer.
+- `GetResultColumns(query)` describes a query's output columns without running it.

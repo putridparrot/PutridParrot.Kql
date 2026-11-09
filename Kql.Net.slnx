@@ -4,10 +4,12 @@
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/Kql.Net.EntityFrameworkCore/Kql.Net.EntityFrameworkCore.csproj" />
+    <Project Path="src/Kql.Net.Redis/Kql.Net.Redis.csproj" />
     <Project Path="src/Kql.Net/Kql.Net.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Kql.Net.EntityFrameworkCore.Tests/Kql.Net.EntityFrameworkCore.Tests.csproj" />
+    <Project Path="tests/Kql.Net.Redis.Tests/Kql.Net.Redis.Tests.csproj" />
     <Project Path="tests/Kql.Net.Tests/Kql.Net.Tests.csproj" />
   </Folder>
 </Solution>

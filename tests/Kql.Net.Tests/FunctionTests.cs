@@ -107,7 +107,7 @@ public class FunctionTests
     [Fact]
     public void CustomFunctionLibrary_CanBeRegistered()
     {
-        Kql.Net.Compilation.FunctionRegistry.Register(typeof(CustomFunctions));
+        _kql.AddFunctions(typeof(CustomFunctions));
         // Kusto.Language must know the function to bind it; built-ins with the same name are overridden.
         Assert.Equal("HELLO!", Eval("toupper('hello!')"));
     }

@@ -16,6 +16,8 @@ public enum JoinKind
 /// <summary>In-memory implementation of the KQL join flavours.</summary>
 public static class JoinHelper
 {
+    private static bool HasNull<TKey>(TKey key) => key is KqlRow row && row.GetValues().Any(v => v is null);
+
     public static IEnumerable<TOut> Join<TL, TR, TKey, TOut>(
         IEnumerable<TL> left, IEnumerable<TR> right,
         Func<TL, TKey> leftKey, Func<TR, TKey> rightKey,
@@ -33,8 +35,9 @@ public static class JoinHelper
             kind = JoinKind.Inner;
         }
 
-        var rightLookup = rightRows.ToLookup(rightKey);
-        var leftLookup = leftRows.ToLookup(leftKey);
+        // KQL join keys compare with ==, so a key with a null part never matches (the row can still appear unmatched)
+        var rightLookup = rightRows.Where(x => !HasNull(rightKey(x))).ToLookup(rightKey);
+        var leftLookup = leftRows.Where(x => !HasNull(leftKey(x))).ToLookup(leftKey);
 
         switch (kind)
         {

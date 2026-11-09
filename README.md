@@ -58,12 +58,36 @@ WHERE CAST("p"."Stock" AS INTEGER) > 0 AND instr(lower("p"."Name"), 'g') > 0
 GROUP BY "p"."Category" ORDER BY COALESCE(SUM(...), 0.0) DESC
 ```
 
+## Redis
+
+The `Kql.Net.Redis` package queries Redis data (built on StackExchange.Redis):
+
+```csharp
+var redis = ConnectionMultiplexer.Connect("localhost");
+var kql = new KqlContext()
+    .AddRedisHashes("Users", redis, "user:*")      // one row per hash, one column per field
+    .AddRedisJson("Orders", redis, "order:*")      // RedisJSON documents
+    .AddRedisStream("Events", redis, "events");    // stream entries with id + timestamp
+
+kql.Execute("Events | where type == 'error' | summarize count() by bin(timestamp, 5m)");
+```
+
+## Other sources and async
+
+- **CSV:** `AddCsvTable("Logs", "logs.csv")`, with column types inferred.
+- **Async sources:** pass an `IAsyncEnumerable<T>` to `AddTable`.
+- **Async results:** `await kql.ExecuteAsync(query)`, or `await foreach (var row in kql.StreamAsync(query))` to
+  stream rows.
+
 See [docs/coverage.md](docs/coverage.md) for supported operators, functions, sources and EF translations.
 
 ## Layout
 
 - `src/Kql.Net`: the core library (depends only on Microsoft.Azure.Kusto.Language)
 - `src/Kql.Net.EntityFrameworkCore`: optional EF Core translations
+- `src/Kql.Net.Redis`: optional Redis sources
+- `tests/Kql.Net.Redis.Tests`: Redis tests. They run against a Redis Stack container via Testcontainers and are
+  skipped when Docker isn't available
 - `tests/Kql.Net.Tests`: core xUnit tests (no EF)
 - `tests/Kql.Net.EntityFrameworkCore.Tests`: EF Core (SQLite) parity and pushdown tests
 - `samples/Kql.Net.Sample`: console demo (`dotnet run --project samples/Kql.Net.Sample`)

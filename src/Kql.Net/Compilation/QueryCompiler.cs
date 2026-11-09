@@ -25,14 +25,18 @@ internal sealed partial class QueryCompiler
     private readonly Dictionary<Symbol, LExpr> _scalarLets = new();
     private readonly Stack<Dictionary<string, object>> _parameters = new();
 
-    public QueryCompiler(KustoCode code, IReadOnlyDictionary<string, TableBinding> tables, IReadOnlyList<IKqlQueryTranslator>? translators = null)
+    public QueryCompiler(KustoCode code, IReadOnlyDictionary<string, TableBinding> tables, IReadOnlyList<IKqlQueryTranslator>? translators = null,
+        FunctionRegistry? functions = null)
     {
         _code = code;
         _tables = tables;
         _translators = translators ?? [];
+        Functions = functions ?? new FunctionRegistry();
     }
 
     private GlobalState Globals => _code.Globals;
+
+    internal FunctionRegistry Functions { get; }
 
     /// <summary>Compiles every tabular expression statement (KQL can return several result sets).</summary>
     public IReadOnlyList<PlanNode> Compile()
@@ -184,18 +188,22 @@ internal sealed partial class QueryCompiler
     }
 
     /// <summary>
-    /// Builds an operator with the input's translator; if the result still needs in-memory evaluation, rebuilds it
-    /// without the translator so provider-only expressions (e.g. EF.Functions) never run in memory.
+    /// Builds an operator without, and (when the input has a translator) with, provider translations. The translated
+    /// form is used only if it needs no in-memory evaluation and the input really is provider-backed when the query
+    /// runs, so provider-only expressions (e.g. EF.Functions) never execute in memory.
     /// </summary>
     private OperatorNode Translated(PlanNode input, Func<IKqlQueryTranslator?, OperatorNode> build)
     {
-        if (input.Translator is { } translator)
-        {
-            var node = build(translator);
-            if (!node.RequiresClient) return node;
-        }
-        return build(null);
+        var plain = build(null);
+        if (input.Translator is not { } translator) return plain;
+        var translated = build(translator);
+        return translated.RequiresClient ? plain : Adaptive(input, plain, translated.ApplyTo, plain.ApplyTo);
     }
+
+    /// <summary>An operator that picks its translated or plain form from the input it actually receives.</summary>
+    private static OperatorNode Adaptive(PlanNode input, OperatorNode plain, Func<IQueryable, IQueryable> translated, Func<IQueryable, IQueryable> fallback,
+        bool keepsProvider = true) =>
+        new(input, plain.Schema, false, q => ExpressionHelpers.IsInMemory(q) ? fallback(q) : translated(q), plain.Name, keepsProvider);
 
     private PlanNode InlineTabularFunction(FunctionCallExpression call)
     {

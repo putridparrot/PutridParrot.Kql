@@ -136,15 +136,16 @@ internal sealed partial class QueryCompiler
                 q => ExpressionHelpers.ToClientQuery((IEnumerable)run.Invoke(null, [q, fn])!, input.Schema.RowType), "where");
         }
 
-        if (input.Translator is { } translator)
-        {
-            // Try a fully translated predicate; approximate (superset) translations such as `has` -> LIKE are allowed
-            // here and followed by the exact predicate in memory on the (already reduced) rows.
-            var translated = WhereNode(input, condition, translator);
-            if (!translated.Node.RequiresClient)
-                return translated.Approximate ? WhereNode(translated.Node, condition, null).Node : translated.Node;
-        }
-        return WhereNode(input, condition, null).Node;
+        var plain = WhereNode(input, condition, null).Node;
+        if (input.Translator is not { } translator) return plain;
+
+        // Try a fully translated predicate; approximate (superset) translations such as `has` -> substring match are
+        // allowed here and followed by the exact predicate in memory on the (already reduced) rows.
+        var (translated, approximate) = WhereNode(input, condition, translator);
+        if (translated.RequiresClient) return plain;
+        return Adaptive(input, plain,
+            approximate ? q => plain.ApplyTo(translated.ApplyTo(q)) : translated.ApplyTo,
+            plain.ApplyTo, keepsProvider: !approximate);
     }
 
     private (OperatorNode Node, bool Approximate) WhereNode(PlanNode input, KExpr condition, IKqlQueryTranslator? translator)

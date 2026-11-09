@@ -56,6 +56,7 @@ public sealed class RowSetTableSource : IKqlTableSource
     /// <param name="rows">Row values, in column order.</param>
     public RowSetTableSource(IReadOnlyList<(string Name, Type Type)> columns, Func<IEnumerable<object?[]>> rows)
     {
+        Columns = columns;
         var kqlColumns = columns.Select(c => (c.Name, c.Type == typeof(object) ? ScalarTypes.Dynamic : KqlTypes.FromClr(c.Type).KqlType)).ToArray();
         var schema = RowSchema.Emit(kqlColumns);
         ElementType = schema.RowType;
@@ -77,6 +78,9 @@ public sealed class RowSetTableSource : IKqlTableSource
 
     public Type ElementType { get; }
 
+    /// <summary>The columns (names and CLR types; <c>object</c> = dynamic) this source was created with.</summary>
+    public IReadOnlyList<(string Name, Type Type)> Columns { get; }
+
     public IQueryable GetQuery()
     {
         var typed = (IEnumerable)typeof(Enumerable).GetMethod(nameof(Enumerable.Cast))!.MakeGenericMethod(ElementType)
@@ -94,9 +98,10 @@ public sealed class RowSetTableSource : IKqlTableSource
     /// The schema is inferred from the rows unless <paramref name="columns"/> is supplied; keys with mixed
     /// value types become <c>dynamic</c>.
     /// </summary>
-    public static RowSetTableSource FromDictionaries(IEnumerable<IDictionary<string, object?>> rows, IReadOnlyList<(string Name, Type Type)>? columns = null)
+    public static RowSetTableSource FromDictionaries(IEnumerable<IDictionary<string, object?>> rows, IReadOnlyList<(string Name, Type Type)>? columns = null,
+        int inferenceSampleSize = 10_000)
     {
-        columns ??= InferColumns(rows);
+        columns ??= InferColumns(rows, inferenceSampleSize);
         var names = columns.Select(c => c.Name).ToArray();
         return new RowSetTableSource(columns, () => rows.Select(r => names.Select(n => r.TryGetValue(n, out var v) ? v : null).ToArray()));
     }
@@ -114,11 +119,11 @@ public sealed class RowSetTableSource : IKqlTableSource
         return FromDictionaries(rows);
     }
 
-    private static IReadOnlyList<(string Name, Type Type)> InferColumns(IEnumerable<IDictionary<string, object?>> rows)
+    private static IReadOnlyList<(string Name, Type Type)> InferColumns(IEnumerable<IDictionary<string, object?>> rows, int sampleSize)
     {
         var order = new List<string>();
         var types = new Dictionary<string, Type?>(StringComparer.Ordinal);
-        foreach (var row in rows.Take(10_000))
+        foreach (var row in rows.Take(sampleSize))
         {
             foreach (var (key, value) in row)
             {

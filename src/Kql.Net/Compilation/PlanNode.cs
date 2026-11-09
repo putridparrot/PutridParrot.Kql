@@ -53,9 +53,11 @@ internal sealed class OperatorNode(PlanNode input, RowSchema schema, bool requir
 
     public override IKqlQueryTranslator? Translator => (keepsProvider ?? !RequiresClient) ? Input.Translator : null;
 
-    public override IQueryable Execute()
+    public override IQueryable Execute() => ApplyTo(Input.Execute());
+
+    /// <summary>Applies this operator to an already-executed input query.</summary>
+    public IQueryable ApplyTo(IQueryable q)
     {
-        var q = Input.Execute();
         if (RequiresClient && !ExpressionHelpers.IsInMemory(q))
             q = ExpressionHelpers.ToClientQuery(q, Input.Schema.RowType);
         return apply(q);
@@ -65,8 +67,12 @@ internal sealed class OperatorNode(PlanNode input, RowSchema schema, bool requir
 }
 
 /// <summary>Combines several inputs (join, union...).</summary>
-internal sealed class CombineNode(IReadOnlyList<PlanNode> inputs, RowSchema schema, Func<IReadOnlyList<IQueryable>, IQueryable> apply)
+/// <param name="translator">The provider translator that still applies to the output, when the combination can run in the provider.</param>
+internal sealed class CombineNode(IReadOnlyList<PlanNode> inputs, RowSchema schema, Func<IReadOnlyList<IQueryable>, IQueryable> apply,
+    IKqlQueryTranslator? translator = null)
     : PlanNode(schema)
 {
+    public override IKqlQueryTranslator? Translator => translator;
+
     public override IQueryable Execute() => apply(inputs.Select(i => i.Execute()).ToList());
 }

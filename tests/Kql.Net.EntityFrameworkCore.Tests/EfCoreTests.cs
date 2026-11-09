@@ -17,9 +17,18 @@ public sealed class Sale
     public OrderStatus Status { get; set; }
 }
 
+public sealed class Client
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = "";
+    public string Country { get; set; } = "";
+    public int Tier { get; set; }
+}
+
 public sealed class SalesDb(DbContextOptions<SalesDb> options) : DbContext(options)
 {
     public DbSet<Sale> Sales => Set<Sale>();
+    public DbSet<Client> Clients => Set<Client>();
 }
 
 /// <summary>
@@ -28,9 +37,9 @@ public sealed class SalesDb(DbContextOptions<SalesDb> options) : DbContext(optio
 /// </summary>
 public abstract class EfCoreParityTests : IDisposable
 {
-    private readonly SqliteConnection _connection = new("DataSource=:memory:");
+    protected readonly SqliteConnection _connection = new("DataSource=:memory:");
     protected readonly List<string> _sql = [];
-    private readonly SalesDb _db;
+    protected readonly SalesDb _db;
     protected readonly KqlContext _efKql;
     protected readonly KqlContext _memKql;
 
@@ -48,14 +57,18 @@ public abstract class EfCoreParityTests : IDisposable
             Id = o.Id, Customer = o.Customer, Region = o.Region, Amount = o.Amount,
             Quantity = o.Quantity, Timestamp = o.Timestamp, Status = o.Status
         }).ToList();
+        var clients = TestData.Customers().Select((c, i) => new Client { Id = i + 1, Name = c.Name, Country = c.Country, Tier = c.Tier }).ToList();
         _db.Sales.AddRange(sales);
+        _db.Clients.AddRange(clients);
         _db.SaveChanges();
         _db.ChangeTracker.Clear();
         _sql.Clear();
 
-        _efKql = new KqlContext().AddTable("Sales", _db.Sales.AsNoTracking());
+        _efKql = new KqlContext()
+            .AddTable("Sales", _db.Sales.AsNoTracking())
+            .AddTable("Clients", _db.Clients.AsNoTracking());
         if (useTranslator) _efKql.UseEntityFrameworkCore();
-        _memKql = new KqlContext().AddTable("Sales", sales);
+        _memKql = new KqlContext().AddTable("Sales", sales).AddTable("Clients", clients);
     }
 
     public virtual void Dispose()
@@ -168,5 +181,89 @@ public abstract class EfCoreParityTests : IDisposable
         _efKql.AddTable("Customers", TestData.Customers());
         _memKql.AddTable("Customers", TestData.Customers());
         AssertSame("Sales | join kind=inner (Customers) on $left.Customer == $right.Name | project Id, Country | sort by Id asc");
+    }
+
+    /// <summary>Asserts parity and that the whole query ran as one SQL statement containing the fragments.</summary>
+    protected void AssertSingleSql(string query, bool ordered, params string[] fragments)
+    {
+        _sql.Clear();
+        AssertSame(query, ordered);
+        // AssertSame runs the in-memory context too, which logs nothing; the EF query must be a single statement
+        var sql = Assert.Single(_sql);
+        foreach (var f in fragments) Assert.Contains(f, sql, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("inner", "INNER JOIN")]
+    [InlineData("innerunique", "JOIN")]
+    [InlineData("leftouter", "LEFT JOIN")]
+    [InlineData("rightouter", "LEFT JOIN")]
+    public void Join_SameDatabase_RunsInSql(string kind, string sqlFragment)
+    {
+        AssertSingleSql($"Sales | join kind={kind} (Clients) on $left.Customer == $right.Name | project Id, Name, Country | sort by Id asc, Name asc",
+            true, sqlFragment);
+    }
+
+    [Theory]
+    [InlineData("leftsemi")]
+    [InlineData("leftanti")]
+    public void SemiAntiJoin_SameDatabase_UsesExists(string kind)
+    {
+        AssertSingleSql($"Sales | join kind={kind} (Clients) on $left.Customer == $right.Name | project Id | sort by Id asc", true, "EXISTS");
+    }
+
+    [Theory]
+    [InlineData("rightsemi")]
+    [InlineData("rightanti")]
+    public void RightSemiAntiJoin_SameDatabase_UsesExists(string kind)
+    {
+        AssertSingleSql($"Sales | join kind={kind} (Clients) on $left.Customer == $right.Name | project Name | sort by Name asc", true, "EXISTS");
+    }
+
+    [Fact]
+    public void DefaultJoin_WithFilters_AndSummarize_RunsInSql()
+    {
+        AssertSingleSql("""
+            Sales
+            | where Amount > 20
+            | join (Clients | where Tier < 3) on $left.Customer == $right.Name
+            | summarize total = sum(Amount) by Country
+            | sort by Country asc
+            """, true, "JOIN", "GROUP BY");
+    }
+
+    [Fact]
+    public void Lookup_SameDatabase_RunsInSql()
+    {
+        AssertSingleSql("Sales | lookup (Clients | project Customer = Name, Country) on Customer | project Id, Country | sort by Id asc", true, "LEFT JOIN");
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_And_StreamAsync_MatchSyncResults()
+    {
+        const string q = "Sales | where Amount > 20 | project Id, Customer | sort by Id asc";
+        var expected = _memKql.Execute(q).Rows.Select(r => string.Join("|", r)).ToList();
+        var asyncResult = await _efKql.ExecuteAsync(q);
+        Assert.Equal(expected, asyncResult.Rows.Select(r => string.Join("|", r)).ToList());
+
+        var streamed = new List<string>();
+        await foreach (var row in _efKql.StreamAsync(q)) streamed.Add(string.Join("|", row));
+        Assert.Equal(expected, streamed);
+    }
+
+    [Fact]
+    public void FullOuterJoin_FallsBackToMemory()
+    {
+        AssertSame("Sales | join kind=fullouter (Clients) on $left.Customer == $right.Name | project Id, Name | sort by Id asc, Name asc");
+    }
+
+    [Fact]
+    public void Join_AcrossDbContexts_FallsBackToMemory()
+    {
+        // a second DbContext has a different query provider, so the join can't be one SQL statement
+        using var other = new SalesDb(new DbContextOptionsBuilder<SalesDb>().UseSqlite(_connection).Options);
+        _efKql.AddTable("OtherClients", other.Clients.AsNoTracking());
+        _memKql.AddTable("OtherClients", _memKql.Execute<Client>("Clients"));
+        AssertSame("Sales | join kind=inner (OtherClients) on $left.Customer == $right.Name | where Name contains 'a' | project Id, Country | sort by Id asc");
     }
 }

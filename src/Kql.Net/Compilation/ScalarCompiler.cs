@@ -372,12 +372,56 @@ internal sealed partial class ScalarCompiler
                 ExpressionType.NotEqual => LExpr.Not(eq),
                 _ => throw new KqlNotSupportedException("ordering comparison of dynamic values", b.TextStart)
             };
+            result = NullGuard(result, left, right);
+        }
+        else if (left.Type == typeof(string))
+        {
+            result = StringEquality(op == ExpressionType.Equal, left, right);
+        }
+        else if (op is ExpressionType.Equal or ExpressionType.NotEqual)
+        {
+            // KQL: comparing with null is never true (null == null is not true either); use isnull() to find nulls
+            result = IsNullConstant(left) || IsNullConstant(right)
+                ? LExpr.Constant(false)
+                : NullGuard(LExpr.MakeBinary(op, left, right), left, right);
         }
         else
         {
-            result = LExpr.MakeBinary(op, left, right);
+            result = LExpr.MakeBinary(op, left, right); // lifted <, <=, >, >= are already false for null
         }
         return LExpr.Convert(result, typeof(bool?));
+    }
+
+    private static bool IsNullConstant(LExpr e) => e is ConstantExpression { Value: null };
+
+    private static bool IsNonNullConstant(LExpr e) => e is ConstantExpression { Value: not null };
+
+    /// <summary>
+    /// Wraps a comparison so it's false when either operand is null. Non-null constants need no check, which keeps
+    /// the common `column == literal` case a plain, index-friendly comparison in SQL.
+    /// </summary>
+    private static LExpr NullGuard(LExpr comparison, LExpr left, LExpr right)
+    {
+        var result = comparison;
+        if (!IsNonNullConstant(right) && CanBeNull(right)) result = LExpr.AndAlso(LExpr.NotEqual(right, LExpr.Constant(null, right.Type)), result);
+        if (!IsNonNullConstant(left) && CanBeNull(left)) result = LExpr.AndAlso(LExpr.NotEqual(left, LExpr.Constant(null, left.Type)), result);
+        return result;
+    }
+
+    private static bool CanBeNull(LExpr e) => !e.Type.IsValueType || System.Nullable.GetUnderlyingType(e.Type) is not null;
+
+    /// <summary>
+    /// KQL strings are never null: a null CLR string is treated as "" (so "" == null is true).
+    /// </summary>
+    private static LExpr StringEquality(bool equal, LExpr left, LExpr right)
+    {
+        var isNullOrEmpty = typeof(string).GetMethod(nameof(string.IsNullOrEmpty))!;
+        LExpr result;
+        if (left is ConstantExpression { Value: null or "" }) result = LExpr.Call(isNullOrEmpty, right);
+        else if (right is ConstantExpression { Value: null or "" }) result = LExpr.Call(isNullOrEmpty, left);
+        else if (IsNonNullConstant(left) || IsNonNullConstant(right)) result = LExpr.Equal(left, right); // null column never equals a non-empty literal
+        else result = LExpr.Equal(LExpr.Coalesce(left, LExpr.Constant("")), LExpr.Coalesce(right, LExpr.Constant("")));
+        return equal ? result : LExpr.Not(result);
     }
 
     /// <summary>Brings two operands to a common runtime type for comparison.</summary>
@@ -461,7 +505,11 @@ internal sealed partial class ScalarCompiler
             result = acc ?? LExpr.Constant(false);
         }
 
-        if (negate) result = LExpr.Not(result);
+        if (negate)
+        {
+            // like ==, a null (non-string) value is neither in nor not in the list
+            result = left.Type == typeof(string) ? LExpr.Not(result) : NullGuard(LExpr.Not(result), left, LExpr.Constant(0));
+        }
         return LExpr.Convert(result, typeof(bool?));
     }
 
@@ -607,7 +655,7 @@ internal sealed partial class ScalarCompiler
 
     private LExpr BindFunction(string name, IReadOnlyList<LExpr> args, SyntaxNode at)
     {
-        var call = FunctionRegistry.TryBind(name, args);
+        var call = _query.Functions.TryBind(name, args);
 
         // Constant-fold deterministic calls with constant arguments (e.g. ago(1d)) so providers see a constant.
         if (call is not null && !NonDeterministic.Contains(name) && args.All(a => a is ConstantExpression))

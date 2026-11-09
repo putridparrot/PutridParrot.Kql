@@ -25,6 +25,27 @@ public sealed class KqlContext
     private readonly Dictionary<string, TableBinding> _tables = new(StringComparer.Ordinal);
     private readonly List<IKqlQueryTranslator> _translators = [];
     private GlobalState? _globals;
+    private int _globalsFunctionVersion = -1;
+
+    /// <summary>
+    /// Scalar functions for this context: the built-ins plus anything registered here. Registering affects only
+    /// this context.
+    /// </summary>
+    public FunctionRegistry Functions { get; } = new();
+
+    /// <summary>Registers every <see cref="Runtime.KqlFunctionAttribute"/>-marked static method of a type as a KQL function.</summary>
+    public KqlContext AddFunctions(Type type)
+    {
+        Functions.Register(type);
+        return this;
+    }
+
+    /// <summary>Registers a delegate as a KQL function, e.g. <c>AddFunction("double_it", (long? x) =&gt; x * 2)</c>.</summary>
+    public KqlContext AddFunction(string name, Delegate implementation)
+    {
+        Functions.Register(name, implementation);
+        return this;
+    }
 
     /// <summary>Registered query translators (see <see cref="AddTranslator"/>).</summary>
     public IReadOnlyList<IKqlQueryTranslator> Translators => _translators;
@@ -74,6 +95,29 @@ public sealed class KqlContext
     /// <summary>Registers a table from a JSON array of objects.</summary>
     public KqlContext AddJsonTable(string name, string json) => AddTable(name, RowSetTableSource.FromJson(json));
 
+    /// <summary>
+    /// Registers a CSV file. Column types are inferred from the data when the table is added; the file is read again
+    /// on each query. For CSV text in memory, use <c>AddTable(name, CsvTableSource.FromText(csv))</c>.
+    /// </summary>
+    public KqlContext AddCsvTable(string name, string path, CsvOptions? options = null) =>
+        AddTable(name, CsvTableSource.FromFile(path, options));
+
+    /// <summary>
+    /// Registers an asynchronous sequence. It's enumerated each time a query runs, so it should be re-enumerable
+    /// (e.g. a method that opens a new stream on each enumeration).
+    /// </summary>
+    public KqlContext AddTable<T>(string name, IAsyncEnumerable<T> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        return AddTable(name, new QueryableTableSource(new AsyncEnumerableAdapter<T>(rows), typeof(T)));
+    }
+
+    private sealed class AsyncEnumerableAdapter<T>(IAsyncEnumerable<T> source) : IEnumerable<T>
+    {
+        public IEnumerator<T> GetEnumerator() => source.ToBlockingEnumerable().GetEnumerator();
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
     /// <summary>Registers a custom source.</summary>
     public KqlContext AddTable(string name, IKqlTableSource source)
     {
@@ -91,8 +135,19 @@ public sealed class KqlContext
     }
 
     /// <summary>The Kusto.Language global state describing the registered tables (useful for editors / IntelliSense).</summary>
-    public GlobalState Globals => _globals ??= GlobalState.Default.WithDatabase(
-        new DatabaseSymbol(DatabaseName, _tables.Values.Select(t => (Symbol)t.Schema.ToTableSymbol(t.Name)).ToArray()));
+    public GlobalState Globals
+    {
+        get
+        {
+            if (_globals is not null && _globalsFunctionVersion == Functions.Version) return _globals;
+            var globals = GlobalState.Default.WithDatabase(
+                new DatabaseSymbol(DatabaseName, _tables.Values.Select(t => (Symbol)t.Schema.ToTableSymbol(t.Name)).ToArray()));
+            var custom = Functions.CustomSymbols(globals);
+            if (custom.Count > 0) globals = globals.WithFunctions(globals.Functions.Concat(custom).ToArray());
+            _globalsFunctionVersion = Functions.Version;
+            return _globals = globals;
+        }
+    }
 
     /// <summary>Parses and binds a query, returning any errors (empty when the query is valid).</summary>
     public IReadOnlyList<KqlDiagnostic> Validate(string query)
@@ -132,17 +187,57 @@ public sealed class KqlContext
             .Select(d => new KqlDiagnostic(d.Code, d.Severity, d.Message, d.Start, d.Length))
             .ToList();
         if (errors.Count > 0) throw new KqlException(errors);
-        return new QueryCompiler(code, _tables, _translators).Compile();
+        return new QueryCompiler(code, _tables, _translators, Functions).Compile();
     }
+
+    private static List<KqlColumn> ResultColumns(PlanNode plan) => plan.Schema.Columns
+        .Select(c => new KqlColumn(c.Name, c.KqlType.Name, Nullable.GetUnderlyingType(c.ClrType) ?? c.ClrType))
+        .ToList();
 
     private static KqlResult Materialize(PlanNode plan)
     {
-        var columns = plan.Schema.Columns
-            .Select(c => new KqlColumn(c.Name, c.KqlType.Name, Nullable.GetUnderlyingType(c.ClrType) ?? c.ClrType))
-            .ToList();
         var reader = RowReader.For(plan.Schema);
         var rows = new List<object?[]>();
         foreach (var row in (IEnumerable)plan.Execute()) rows.Add(reader(row!));
-        return new KqlResult(columns, rows);
+        return new KqlResult(ResultColumns(plan), rows);
+    }
+
+    /// <summary>
+    /// Runs a query asynchronously and returns its (last) result set. Provider-backed queries (e.g. EF Core) are
+    /// read with the provider's async enumeration.
+    /// </summary>
+    public async Task<KqlResult> ExecuteAsync(string query, CancellationToken cancellationToken = default)
+    {
+        var plan = Compile(query)[^1];
+        var rows = new List<object?[]>();
+        await foreach (var row in Stream(plan, cancellationToken).ConfigureAwait(false)) rows.Add(row);
+        return new KqlResult(ResultColumns(plan), rows);
+    }
+
+    /// <summary>
+    /// Runs a query and streams its rows (values in column order) as they're produced, without collecting the whole
+    /// result. Operators that need all their input (sort, summarize, joins in memory...) still buffer internally.
+    /// </summary>
+    public IAsyncEnumerable<object?[]> StreamAsync(string query, CancellationToken cancellationToken = default) =>
+        Stream(Compile(query)[^1], cancellationToken);
+
+    /// <summary>The columns a query would return, without running it.</summary>
+    public IReadOnlyList<KqlColumn> GetResultColumns(string query) => ResultColumns(Compile(query)[^1]);
+
+    private static async IAsyncEnumerable<object?[]> Stream(PlanNode plan,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var reader = RowReader.For(plan.Schema);
+        var query = plan.Execute();
+        if (query is IAsyncEnumerable<object> async)
+        {
+            await foreach (var row in async.WithCancellation(cancellationToken).ConfigureAwait(false)) yield return reader(row);
+            yield break;
+        }
+        foreach (var row in (IEnumerable)query)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return reader(row!);
+        }
     }
 }
