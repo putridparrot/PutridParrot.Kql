@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Data;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Text.Json;
 using Kql.Net.Runtime;
@@ -66,35 +67,51 @@ public sealed class KqlResult : IReadOnlyList<IReadOnlyList<object?>>
         var t = typeof(T);
         if (Schema.KqlTypes.IsScalarClrType(t) || t == typeof(object))
             return Rows.Select(r => (T)Convert(r.Length > 0 ? r[0] : null, t)!);
-        return Rows.Select(r => (T)Map(r, t));
+        var map = Mapper(t);
+        return Rows.Select(r => (T)map(r));
     }
 
-    private object Map(object?[] row, Type type)
+    private static readonly MethodInfo ConvertMethod = typeof(KqlResult).GetMethod(nameof(Convert), BindingFlags.NonPublic | BindingFlags.Static)!;
+
+    /// <summary>
+    /// Builds (once per <see cref="As{T}"/> call) a compiled delegate that maps a row onto <paramref name="type"/>:
+    /// through the constructor with the most parameters when there is no parameterless one (records), otherwise by
+    /// setting public properties/fields whose names match columns.
+    /// </summary>
+    private Func<object?[], object> Mapper(Type type)
     {
+        var row = Expression.Parameter(typeof(object?[]), "row");
+        Expression Value(int ordinal, Type target) => Expression.Convert(
+            Expression.Call(ConvertMethod, Expression.ArrayIndex(row, Expression.Constant(ordinal)), Expression.Constant(target, typeof(Type))), target);
+
+        Expression body;
         var ctor = type.GetConstructor(Type.EmptyTypes);
-        if (ctor is null)
+        if (ctor is null && !type.IsValueType)
         {
             // records / immutable types: bind constructor parameters by name
             var best = type.GetConstructors().OrderByDescending(c => c.GetParameters().Length).First();
-            var args = best.GetParameters().Select(p =>
-                _ordinals.TryGetValue(p.Name!, out var i) || TryOrdinalIgnoreCase(p.Name!, out i) ? Convert(row[i], p.ParameterType) : DefaultOf(p.ParameterType)).ToArray();
-            return best.Invoke(args);
+            body = Expression.New(best, best.GetParameters().Select(p =>
+                _ordinals.TryGetValue(p.Name!, out var i) || TryOrdinalIgnoreCase(p.Name!, out i)
+                    ? Value(i, p.ParameterType)
+                    : (Expression)Expression.Default(p.ParameterType)));
         }
-
-        var obj = ctor.Invoke(null);
-        for (var i = 0; i < Columns.Count; i++)
+        else
         {
-            var name = Columns[i].Name;
-            var prop = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-            if (prop is { CanWrite: true })
+            var bindings = new List<MemberBinding>();
+            var bound = new HashSet<MemberInfo>();
+            for (var i = 0; i < Columns.Count; i++)
             {
-                prop.SetValue(obj, Convert(row[i], prop.PropertyType));
-                continue;
+                var name = Columns[i].Name;
+                MemberInfo? member = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase) is { CanWrite: true } prop
+                    ? prop
+                    : type.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase) is { IsInitOnly: false } field ? field : null;
+                if (member is null || !bound.Add(member)) continue;
+                var memberType = member is PropertyInfo pi ? pi.PropertyType : ((FieldInfo)member).FieldType;
+                bindings.Add(Expression.Bind(member, Value(i, memberType)));
             }
-            var field = type.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-            field?.SetValue(obj, Convert(row[i], field.FieldType));
+            body = Expression.MemberInit(ctor is null ? Expression.New(type) : Expression.New(ctor), bindings);
         }
-        return obj;
+        return Expression.Lambda<Func<object?[], object>>(Expression.Convert(body, typeof(object)), row).Compile();
     }
 
     private bool TryOrdinalIgnoreCase(string name, out int ordinal)

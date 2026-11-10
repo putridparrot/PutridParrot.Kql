@@ -1,0 +1,36 @@
+<Project>
+
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <!-- NuGet package metadata for the libraries under src/. -->
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <!-- "Kql.Net" on nuget.org belongs to an unrelated package, so package ids carry the owner prefix;
+         assembly names and namespaces stay Kql.Net. -->
+    <PackageId>PutridParrot.$(MSBuildProjectName)</PackageId>
+    <Authors>Mark Timmings</Authors>
+    <Company>PutridParrot</Company>
+    <Copyright>Copyright (c) 2026 Mark Timmings</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/putridparrot/Kql.Net</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/putridparrot/Kql.Net.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>kql;kusto;query;linq;iqueryable</PackageTags>
+
+    <!-- XML docs for IntelliSense; members without docs aren't an error. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+
+    <!-- Source Link (built into the SDK) and symbol packages. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)../README.md" Pack="true" PackagePath="/" Visible="false" />
+  </ItemGroup>
+
+</Project>

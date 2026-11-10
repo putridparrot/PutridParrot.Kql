@@ -142,6 +142,15 @@ public abstract class EfCoreParityTests : IDisposable
     }
 
     [Fact]
+    public void MixedConjuncts_TranslatablePartRunsInSql()
+    {
+        // one `where` mixing a SQL-translatable condition with a client-only one: the SQL part still filters in SQL
+        AssertSame("Sales | where Customer matches regex '^[a-c]' and Region == 'US' and Amount > 10 | project Id | sort by Id asc");
+        Assert.Contains("WHERE", LastSql);
+        Assert.Contains("'US'", LastSql);
+    }
+
+    [Fact]
     public void EnumColumns()
     {
         AssertSame("Sales | where Status == 'Shipped' | project Id, Status | sort by Id asc");

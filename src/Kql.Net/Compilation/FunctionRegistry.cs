@@ -73,7 +73,10 @@ public sealed class FunctionRegistry
         foreach (var (name, impls) in _custom)
         {
             if (globals.GetFunction(name) is not null || globals.GetAggregate(name) is not null) continue;
-            var signatures = impls.Select(i => ToSignature(i.Method)).ToArray();
+            // re-registering with the same parameter types replaces the implementation: declare that signature once
+            var signatures = impls
+                .DistinctBy(i => string.Join(",", i.Method.GetParameters().Select(p => p.ParameterType.FullName)))
+                .Select(i => ToSignature(i.Method)).ToArray();
             symbols.Add(new FunctionSymbol(name, signatures));
         }
         return symbols;

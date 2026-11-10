@@ -25,6 +25,18 @@ internal sealed partial class ScalarCompiler
 
     private static readonly HashSet<string> NonDeterministic = new(StringComparer.Ordinal) { "rand", "new_guid", "newguid" };
 
+    /// <summary>Functions whose (folded) value depends on when the query is compiled.</summary>
+    private static readonly HashSet<string> ClockFunctions = new(StringComparer.Ordinal) { "now", "ago" };
+
+    /// <summary>Functions implemented by the Kql.Net.Geo package (named in the error when it isn't in use).</summary>
+    private static readonly HashSet<string> GeoPackageFunctions = new(StringComparer.Ordinal)
+    {
+        "geo_point_to_h3cell", "geo_h3cell_to_central_point", "geo_h3cell_to_polygon", "geo_h3cell_level", "geo_h3cell_parent",
+        "geo_h3cell_children", "geo_h3cell_neighbors", "geo_h3cell_rings", "geo_polygon_to_h3cells", "geo_point_buffer",
+        "geo_line_buffer", "geo_polygon_buffer", "geo_intersection_2polygons", "geo_intersection_line_with_polygon",
+        "geo_union_polygons_array", "geo_union_lines_array", "geo_simplify_polygons_array", "geo_info_from_ip_address"
+    };
+
     private readonly QueryCompiler _query;
     private readonly RowSchema? _schema;
     private readonly LExpr? _row;
@@ -137,6 +149,13 @@ internal sealed partial class ScalarCompiler
 
     /// <summary>Compiles a predicate (null => false).</summary>
     public LExpr CompilePredicate(KExpr node) => ExpressionHelpers.ToPredicate(Compile(node));
+
+    /// <summary>Compiles a predicate only to find out whether it needs in-memory evaluation.</summary>
+    public bool CompileAndReport(KExpr node)
+    {
+        CompilePredicate(node);
+        return RequiresClient;
+    }
 
     private LExpr CompileCore(KExpr node)
     {
@@ -713,7 +732,9 @@ internal sealed partial class ScalarCompiler
         // Constant-fold deterministic calls with constant arguments (e.g. ago(1d)) so providers see a constant.
         if (call is not null && !NonDeterministic.Contains(name) && args.All(a => a is ConstantExpression))
         {
-            var value = LExpr.Lambda(LExpr.Convert(call, typeof(object))).Compile().DynamicInvoke();
+            // the clock (and custom functions, which may read anything) make the folded value execution-specific
+            if (ClockFunctions.Contains(name) || _query.Functions.CustomFunctionNames.Contains(name)) _query.MarkNotCacheable();
+            var value = ExpressionHelpers.Evaluate(call);
             return LExpr.Constant(value, call.Type);
         }
 
@@ -722,7 +743,8 @@ internal sealed partial class ScalarCompiler
             return ExpressionHelpers.Coerce(translated.Expression, resultType);
 
         RequiresClient = true;
-        return call ?? throw new KqlNotSupportedException($"function {name}()", at.TextStart);
+        return call ?? throw new KqlNotSupportedException($"function {name}()", at.TextStart,
+            GeoPackageFunctions.Contains(name) ? "Add the PutridParrot.Kql.Net.Geo package and call KqlContext.UseGeo()." : null);
     }
 
     private LExpr Window(string name, List<KExpr> args, SyntaxNode at)

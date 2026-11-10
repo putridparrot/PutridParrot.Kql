@@ -24,7 +24,13 @@ public class KqlException : Exception
 public sealed class KqlNotSupportedException : KqlException
 {
     public KqlNotSupportedException(string feature, int position)
-        : base($"'{feature}' is not supported by Kql.Net (at position {position}).")
+        : this(feature, position, null)
+    {
+    }
+
+    /// <param name="hint">How to get the feature, e.g. which package adds it (appended to the message).</param>
+    public KqlNotSupportedException(string feature, int position, string? hint)
+        : base($"'{feature}' is not supported by Kql.Net (at position {position}).{(hint is null ? "" : " " + hint)}")
     {
         Feature = feature;
         Position = position;

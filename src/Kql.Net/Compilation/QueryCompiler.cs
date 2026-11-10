@@ -38,6 +38,15 @@ internal sealed partial class QueryCompiler
 
     internal FunctionRegistry Functions { get; }
 
+    /// <summary>
+    /// False once compilation has read data or the clock (pivot/bag_unpack schemas, toscalar, tabular `in`, folded
+    /// now()/ago() or custom functions) or created per-execution state (materialize, mv-apply): such plans must not
+    /// be reused for later executions.
+    /// </summary>
+    internal bool Cacheable { get; private set; } = true;
+
+    internal void MarkNotCacheable() => Cacheable = false;
+
     /// <summary>Compiles every tabular expression statement (KQL can return several result sets).</summary>
     public IReadOnlyList<PlanNode> Compile()
     {
@@ -84,7 +93,7 @@ internal sealed partial class QueryCompiler
             var compiled = new ScalarCompiler(this, null, null).Compile(expr);
             _scalarLets[symbol] = compiled is System.Linq.Expressions.ConstantExpression
                 ? compiled
-                : LExpr.Constant(LExpr.Lambda(LExpr.Convert(compiled, typeof(object))).Compile().DynamicInvoke(), compiled.Type);
+                : LExpr.Constant(ExpressionHelpers.Evaluate(compiled), compiled.Type);
         }
     }
 
@@ -243,7 +252,8 @@ internal sealed partial class QueryCompiler
         if (tabularOrScalar.ResultType is not TableSymbol)
         {
             var e = new ScalarCompiler(this, null, null).Compile(tabularOrScalar);
-            return LExpr.Lambda(LExpr.Convert(e, typeof(object))).Compile().DynamicInvoke();
+            if (e is not System.Linq.Expressions.ConstantExpression) MarkNotCacheable();
+            return ExpressionHelpers.Evaluate(e);
         }
         return EvaluateColumn(tabularOrScalar).FirstOrDefault();
     }
@@ -251,6 +261,7 @@ internal sealed partial class QueryCompiler
     /// <summary>Evaluates a tabular expression now and returns the values of its first column.</summary>
     internal IReadOnlyList<object?> EvaluateColumn(KExpr tabular)
     {
+        MarkNotCacheable();
         var plan = CompileTabular(tabular);
         var reader = RowReader.For(plan.Schema);
         var values = new List<object?>();
@@ -260,8 +271,9 @@ internal sealed partial class QueryCompiler
 
     private PlanNode Materialize(PlanNode input)
     {
-        IList? cache = null;
-        return new RowsNode(input.Schema, () => cache ??= input.Execute().Cast<object>().ToList());
+        MarkNotCacheable(); // the materialized rows are kept by the plan
+        IEnumerable? cache = null;
+        return new RowsNode(input.Schema, () => cache ??= input.Execute().Cast<object>().ToList().CastTo(input.Schema.RowType));
     }
 
     private PlanNode ScalarAsTable(KExpr expr)

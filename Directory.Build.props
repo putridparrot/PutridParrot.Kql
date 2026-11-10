@@ -1,0 +1,14 @@
+<Project>
+
+  <!-- Settings shared by every project in the repository. -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <!-- CI sets this so paths in PDBs and Source Link are normalised. -->
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <!-- Overridden by CI (-p:Version=...) from the git tag. -->
+    <Version>0.0.0-dev</Version>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>

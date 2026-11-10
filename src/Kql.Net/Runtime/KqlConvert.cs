@@ -204,10 +204,22 @@ public static class KqlConvert
 
         var type = value.GetType();
         if (Schema.KqlTypes.IsScalarClrType(type)) return null;
+        return MemberReaders.GetOrAdd((type, name), static key => BuildMemberReader(key.Type, key.Name))?.Invoke(value);
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Type Type, string Name), Func<object, object?>?> MemberReaders = new();
+
+    private static Func<object, object?>? BuildMemberReader(Type type, string name)
+    {
         var prop = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-        if (prop is not null && prop.GetIndexParameters().Length == 0) return prop.GetValue(value);
-        var field = type.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-        return field?.GetValue(value);
+        MemberInfo? member = prop is not null && prop.GetIndexParameters().Length == 0 && prop.GetMethod is not null
+            ? prop
+            : type.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+        if (member is null) return null;
+        var p = System.Linq.Expressions.Expression.Parameter(typeof(object), "o");
+        var read = System.Linq.Expressions.Expression.MakeMemberAccess(System.Linq.Expressions.Expression.Convert(p, type), member);
+        return System.Linq.Expressions.Expression.Lambda<Func<object, object?>>(
+            System.Linq.Expressions.Expression.Convert(read, typeof(object)), p).Compile();
     }
 
     /// <summary>Indexes a dynamic value: by string key (bag) or by integer position (array, negative counts from the end).</summary>

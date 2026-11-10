@@ -11,11 +11,13 @@ public static class KqlAggregates
 
     public static object? MakeSet(IEnumerable<object?> values, long? maxSize)
     {
+        var seen = new HashSet<object?>(KqlComparer.Values);
         var result = new List<object?>();
+        var limit = Limit(maxSize);
         foreach (var v in values.Where(v => v is not null).Select(Dynamic.Normalize))
         {
-            if (!result.Any(x => KqlComparer.ValueEquals(x, v))) result.Add(v);
-            if (result.Count >= Limit(maxSize)) break;
+            if (seen.Add(v)) result.Add(v);
+            if (result.Count >= limit) break;
         }
         return result;
     }

@@ -31,6 +31,23 @@ public static class KqlComparer
         _ => v.GetHashCode()
     };
 
+    /// <summary>Typed equality used by emitted row types (ordinal for strings).</summary>
+    [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
+    public static bool TypedEquals<T>(T a, T b) => EqualityComparer<T>.Default.Equals(a, b);
+
+    /// <summary>Typed hash used by emitted row types (consistent with <see cref="ValueHash"/>).</summary>
+    [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
+    public static int TypedHash<T>(T value) => value is null ? 0 : EqualityComparer<T>.Default.GetHashCode(value);
+
+    /// <summary>An equality comparer over KQL values (<see cref="ValueEquals"/> / <see cref="ValueHash"/>).</summary>
+    public static IEqualityComparer<object?> Values { get; } = new ValueComparer();
+
+    private sealed class ValueComparer : IEqualityComparer<object?>
+    {
+        public new bool Equals(object? x, object? y) => ValueEquals(x, y);
+        public int GetHashCode(object? obj) => ValueHash(obj);
+    }
+
     /// <summary>Ordering comparer for in-memory sorting (ordinal strings, nulls first).</summary>
     public static IComparer<T> For<T>() => typeof(T) == typeof(string)
         ? (IComparer<T>)(object)StringComparer.Ordinal

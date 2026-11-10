@@ -12,6 +12,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Description>Entity Framework Core support for Kql.Net: translates more KQL functions to SQL and runs joins in the database when both sides share a provider.</Description>
+    <PackageTags>$(PackageTags);efcore;entityframeworkcore;sql</PackageTags>
   </PropertyGroup>
 
 </Project>

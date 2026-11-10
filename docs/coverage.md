@@ -31,13 +31,16 @@ Anything else, such as `matches regex`, `extract` or `parse`, falls back to memo
 result is the same; only where the work happens changes. Write your own translator by implementing
 `IKqlQueryTranslator` and registering it with `KqlContext.AddTranslator`.
 
+A `where` that mixes translatable and client-only conditions joined by `and` is split: the translatable
+conditions filter in SQL and the rest run in memory on the rows that come back.
+
 ## Tabular operators
 
 | Operator | Status | Runs in |
 |---|---|---|
 | `where` / `filter` | ✅ | SQL unless it uses a memory-only function |
 | `project`, `project-away`, `project-keep`, `project-rename`, `project-reorder` (incl. wildcards) | ✅ | SQL |
-| `extend` | ✅ | SQL unless it uses a memory-only function |
+| `extend` (incl. multi-column results: `extend series_stats(y)`, `extend (a, b) = series_fft(y)`; `project` too) | ✅ | SQL unless it uses a memory-only function |
 | `take` / `limit`, `sample` | ✅ (`sample` = take) | SQL |
 | `sort` / `order` (asc/desc, nulls first/last) | ✅ | SQL (ordinal string comparer in memory) |
 | `top` | ✅ | SQL |
@@ -88,16 +91,39 @@ negated), `like`, `matches regex`, `in`/`!in`/`in~` (literal lists, dynamic arra
 | Time | `datetime_utc_to_local`, `datetime_local_to_utc` (IANA or Windows zone ids), `datetime_list_timezones`, `unixtime_microseconds/nanoseconds_todatetime` |
 | Math | also `acos`, `asin`, `atan`, `atan2`, `cot`, `degrees`, `radians` |
 | Sketches | `dcount_hll`, `percentile_tdigest`, `percentiles_array_tdigest`, `rank_tdigest`, `percentrank_tdigest` (Kql.Net's sketches are exact) |
+| Geospatial (GeoJSON dynamic values, geodesic edges, metres) | `geo_distance_2points` (sphere, or WGS-84 with `use_spheroid`), `geo_azimuth`, `geo_angle`, `geo_point_in_circle`, `geo_point_in_polygon`, `geo_distance_point_to_line`, `geo_distance_point_to_polygon`, `geo_closest_point_on_line`, `geo_closest_point_on_polygon`, `geo_line_length`, `geo_polygon_area`, `geo_polygon_perimeter`, `geo_line_centroid`, `geo_polygon_centroid`, `geo_line_interpolate_point`, `geo_line_locate_point`, `geo_line_densify`, `geo_polygon_densify`, `geo_line_simplify`, `geo_polygon_simplify`, `geo_intersects_2lines`, `geo_intersects_line_with_polygon`, `geo_intersects_2polygons`, `geo_intersection_2lines`, `geo_from_wkt`, `geo_point_to_geohash`, `geo_geohash_to_central_point`, `geo_geohash_to_polygon`, `geo_geohash_neighbors`, `geo_point_to_s2cell`, `geo_s2cell_to_central_point`, `geo_s2cell_to_polygon`, `geo_s2cell_neighbors`, `geo_polygon_to_s2cells`, `geo_line_to_s2cells` |
+
+Geospatial calculations use a sphere with the Earth's mean radius (6,371,008.8 m). A polygon ring encloses the
+smaller of the two regions it divides the sphere into, whichever way round it is ordered. S2 coverings are at a
+single level and return null above 65,536 cells.
+
+The rest of the geo family comes with the optional `PutridParrot.Kql.Net.Geo` package (built on NetTopologySuite and
+pocketken.H3), enabled with `new KqlContext().UseGeo()`:
+
+| Area | Functions |
+|---|---|
+| H3 cells | `geo_point_to_h3cell`, `geo_h3cell_to_central_point`, `geo_h3cell_to_polygon`, `geo_h3cell_level`, `geo_h3cell_parent`, `geo_h3cell_children`, `geo_h3cell_neighbors`, `geo_h3cell_rings`, `geo_polygon_to_h3cells` (cells that intersect, optionally within a radius; null above 65,536 cells) |
+| Buffers | `geo_point_buffer`, `geo_line_buffer`, `geo_polygon_buffer` (a negative radius shrinks); the tolerance is the maximum error in metres |
+| Unions and intersections | `geo_union_polygons_array`, `geo_union_lines_array`, `geo_simplify_polygons_array`, `geo_intersection_2polygons`, `geo_intersection_line_with_polygon` |
+| IP addresses | `geo_info_from_ip_address`, when you pass a lookup: `UseGeo(ip => ...)`, for example backed by a MaxMind GeoIP2 database |
+
+These operations run in a gnomonic projection centred on the inputs, which maps geodesic edges to straight lines, so
+unions and intersections are exact for geodesic polygons. Inputs must lie within 80° of their common centre;
+larger shapes return null. Without `UseGeo()`, calling one of these functions throws `KqlNotSupportedException`
+naming the package.
 
 **Not implemented:**
-- The `geo_*` family.
-- `series_decompose*` and the other series analysis functions (`fft`, `periods`, `seasonal`, `fit_2lines`, `fit_poly`, `iir`), and the multi-column `series_stats`.
 - Statistical distributions (`beta_*`, `gamma`, `erf`) and unit conversions (`convert_*`).
 - `parse_xml` and `parse_user_agent`.
 - `hash_xxhash64`.
 - Functions that only exist inside a Kusto cluster: `cursor_*`, `extent_*`, `current_*`, `ingestion_time`, graph functions.
-| Series (dynamic arrays, e.g. from `make-series`) | `series_fill_forward`, `series_fill_backward`, `series_fill_const`, `series_fill_linear`, `series_stats_dynamic`, `series_add`, `series_subtract`, `series_multiply`, `series_divide`, `series_greater`, `series_less`, `series_fir` (e.g. moving averages) |
+| Series (dynamic arrays, e.g. from `make-series`) | `series_fill_forward`, `series_fill_backward`, `series_fill_const`, `series_fill_linear`, `series_stats_dynamic`, `series_add`, `series_subtract`, `series_multiply`, `series_divide`, `series_greater`, `series_less`, `series_fir` (e.g. moving averages), `series_iir`, `series_stats`, `series_fit_line`, `series_fit_2lines(_dynamic)`, `series_fit_poly`, `series_fft`, `series_ifft`, `series_seasonal`, `series_periods_detect`, `series_periods_validate`, `series_decompose`, `series_decompose_anomalies`, `series_decompose_forecast`, `series_outliers` (with kind/percentiles) |
 | Window (need serialized input: after `sort`/`order`/`serialize`) | `row_number` (with start/restart), `prev`, `next` (offset, default), `row_cumsum` (restart), `row_rank_dense`, `row_rank_min`. Operators using them run in memory |
+
+The series analysis functions follow Kusto's documented methods, but the numbers can differ slightly from a Kusto
+cluster's. Periods are detected by rank autocorrelation, preferring the shorter period when a multiple scores about the
+same. Seasonal components are per-position medians around the trend. Anomaly scores use Tukey fences over the
+residual (`ctukey`: 10th/90th percentiles). `series_fft` is a plain O(n²) DFT.
 
 Deterministic calls with constant arguments (e.g. `ago(1d)`) are evaluated once at compile time, so a provider
 sees a constant.
@@ -155,7 +181,48 @@ approximate sketches for these; Kql.Net computes exact values instead (fine for 
 | CSV | `AddCsvTable("T", path, options)` or `AddTable("T", CsvTableSource.FromText(csv))`. Handles quoted fields, embedded commas and newlines, and custom delimiters. Types are inferred (long, real, bool, datetime, timespan, guid, string) or set explicitly; the file is re-read on each query |
 | `IAsyncEnumerable<T>` | `AddTable("T", asyncRows)`, enumerated on each query, so it must be re-enumerable |
 | Custom | implement `IKqlTableSource` |
-| Redis (`Kql.Net.Redis` package) | `AddRedisStrings`, `AddRedisHashes`, `AddRedisJson` (RedisJSON) and `AddRedisStream`. Keys are found with SCAN and values fetched in pipelined batches; the schema is inferred from a sample and data is read on each query. Operators run in memory |
+| Redis (`Kql.Net.Redis` package) | `AddRedisStrings`, `AddRedisHashes`, `AddRedisJson` (RedisJSON) and `AddRedisStream`. Keys are found with SCAN and values fetched in pipelined batches; the schema is inferred from a sample and data is read on each query. Operators run in memory. `AddRedisSearch` reads a RediSearch index with filters pushed down (see below) |
+
+## RediSearch pushdown (`Kql.Net.Redis`)
+
+`AddRedisSearch("T", redis, "idx:name", options)` queries a RediSearch index (FT.CREATE ... ON HASH or ON JSON).
+The table has a `key` column and one column per index attribute: NUMERIC becomes `real`; TAG, TEXT and GEO become
+`string`; multi-value JSON paths (`$.tags[*]`) become `dynamic`. The leading operators of a query run in Redis as one
+FT.SEARCH command; the rest run in memory.
+
+| KQL | FT.SEARCH | Exact? |
+|---|---|---|
+| `==`, `!=`, `<`, `<=`, `>`, `>=`, `between`, `in` on NUMERIC | `@f:[a b]`, `-@f:[v v]`, exclusive bounds with `(` | yes |
+| `isnull(x)` / `isnotnull(x)` on NUMERIC | `-@f:[-inf +inf]` / `@f:[-inf +inf]` | yes |
+| `==`, `in`, `=~`, `in~` on TAG | `@f:{a \| b}` | no: tags ignore case and whitespace, so this is a prefilter |
+| `has`, `has_any`, `has_all`, `==`, `=~` on TEXT | `@f:(term)`, `@f:"phrase"` | no; only with `PushDownText = true` (see below) |
+| `and`, `or`, `not(...)` | intersection, `\|`, `-(...)` | `not` only over exact filters |
+| `take n` | `LIMIT 0 n` | when the filter is exact |
+| `top n by x` / `sort by x \| take n` on NUMERIC | `SORTBY x ... LIMIT 0 n` | when the filter is exact; nulls placed as KQL does |
+| `count` | `LIMIT 0 0` (the total) | when the filter is exact |
+
+Filters pass through `project` and `extend` as long as they refer to source columns. The whole query is
+re-applied in memory to the documents found, so a prefilter never changes the result. Conditions that can't be
+translated (functions, comparisons between columns...) simply aren't pushed.
+
+TEXT pushdown is off by default because RediSearch tokenizes differently from KQL. `_` doesn't separate terms, and
+stemming and stop words apply. So `description has 'knife'` misses a document whose text is `steel_knife`, which
+KQL matches. Turn on `RedisSearchOptions.PushDownText` when your text can't contain such joins. `OnCommand` logs
+each FT.SEARCH sent. Results are paged with `PageSize` (default 1000) and are limited by the server's
+`MAXSEARCHRESULTS`.
+
+## Performance
+
+- A query run again on the same `KqlContext` reuses its compiled plan, and in-memory parts reuse their compiled
+  delegates. That makes small repeated queries about 20 times faster. Plans whose compilation read data or the
+  clock aren't cached; this covers `now()`, `ago()`, `toscalar`, tabular `in`, `evaluate`, `materialize`, `mv-apply`
+  and folded custom functions. Registering a table, function or translator clears the cache, and
+  `KqlContext.PlanCacheSize` (default 256, 0 to turn it off) bounds it. Data changes are always seen, because
+  sources are read on every execution.
+- Emitted row types implement equality and hashing directly, which speeds up `summarize`, `distinct` and joins.
+  `make_set` and the `set_*` functions hash their values, and `pivot` groups rows by hash.
+- Rows from DataTables, dictionaries, JSON, CSV and Redis are built through compiled constructors, and
+  `KqlResult.As<T>` maps rows through a compiled delegate.
 
 ## Async results
 

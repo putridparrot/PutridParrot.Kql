@@ -78,8 +78,94 @@ internal static class RowTypeFactory
             }
             cil.Emit(OpCodes.Ret);
 
+            EmitEquality(tb, fields);
             return tb.CreateType();
         }
+    }
+
+    private static readonly MethodInfo TypedEquals = typeof(KqlComparer).GetMethod(nameof(KqlComparer.TypedEquals))!;
+    private static readonly MethodInfo TypedHash = typeof(KqlComparer).GetMethod(nameof(KqlComparer.TypedHash))!;
+    private static readonly MethodInfo ValueEquals = typeof(KqlComparer).GetMethod(nameof(KqlComparer.ValueEquals))!;
+    private static readonly MethodInfo ValueHash = typeof(KqlComparer).GetMethod(nameof(KqlComparer.ValueHash))!;
+
+    /// <summary>
+    /// Overrides <see cref="KqlRow"/>'s equality members with field-by-field code: typed comparisons for scalar
+    /// columns (ordinal strings) and <see cref="KqlComparer.ValueEquals"/> for dynamic ones, without boxing.
+    /// </summary>
+    private static void EmitEquality(TypeBuilder tb, FieldBuilder[] fields)
+    {
+        bool IsTyped(Type t) => t != typeof(object) && Schema.KqlTypes.IsScalarClrType(t);
+
+        void LoadForObjectCall(ILGenerator il, FieldBuilder f)
+        {
+            il.Emit(OpCodes.Ldfld, f);
+            if (f.FieldType.IsValueType) il.Emit(OpCodes.Box, f.FieldType);
+        }
+
+        // protected override bool EqualsCore(KqlRow other)
+        var eq = tb.DefineMethod("EqualsCore", MethodAttributes.Family | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+            typeof(bool), [typeof(KqlRow)]);
+        var il = eq.GetILGenerator();
+        var other = il.DeclareLocal(tb);
+        var no = il.DefineLabel();
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Castclass, tb);
+        il.Emit(OpCodes.Stloc, other);
+        foreach (var f in fields)
+        {
+            var typed = IsTyped(f.FieldType);
+            il.Emit(OpCodes.Ldarg_0);
+            if (typed) il.Emit(OpCodes.Ldfld, f); else LoadForObjectCall(il, f);
+            il.Emit(OpCodes.Ldloc, other);
+            if (typed) il.Emit(OpCodes.Ldfld, f); else LoadForObjectCall(il, f);
+            il.Emit(OpCodes.Call, typed ? TypedEquals.MakeGenericMethod(f.FieldType) : ValueEquals);
+            il.Emit(OpCodes.Brfalse, no);
+        }
+        il.Emit(OpCodes.Ldc_I4_1);
+        il.Emit(OpCodes.Ret);
+        il.MarkLabel(no);
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Ret);
+
+        // public override int GetHashCode(): 17, then h * 31 + hash(field)
+        var hash = tb.DefineMethod("GetHashCode", MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+            typeof(int), Type.EmptyTypes);
+        il = hash.GetILGenerator();
+        il.Emit(OpCodes.Ldc_I4, 17);
+        foreach (var f in fields)
+        {
+            var typed = IsTyped(f.FieldType);
+            il.Emit(OpCodes.Ldc_I4, 31);
+            il.Emit(OpCodes.Mul);
+            il.Emit(OpCodes.Ldarg_0);
+            if (typed) il.Emit(OpCodes.Ldfld, f); else LoadForObjectCall(il, f);
+            il.Emit(OpCodes.Call, typed ? TypedHash.MakeGenericMethod(f.FieldType) : ValueHash);
+            il.Emit(OpCodes.Add);
+        }
+        il.Emit(OpCodes.Ret);
+
+        // public override bool HasNullValue()
+        var hasNull = tb.DefineMethod("HasNullValue", MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+            typeof(bool), Type.EmptyTypes);
+        il = hasNull.GetILGenerator();
+        var yes = il.DefineLabel();
+        foreach (var f in fields)
+        {
+            if (f.FieldType.IsValueType && Nullable.GetUnderlyingType(f.FieldType) is null) continue;
+            il.Emit(OpCodes.Ldarg_0);
+            if (f.FieldType.IsValueType)
+            {
+                il.Emit(OpCodes.Ldflda, f);
+                il.Emit(OpCodes.Call, f.FieldType.GetProperty("HasValue")!.GetMethod!);
+            }
+            else il.Emit(OpCodes.Ldfld, f);
+            il.Emit(OpCodes.Brfalse, yes);
+        }
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Ret);
+        il.MarkLabel(yes);
+        il.Emit(OpCodes.Ldc_I4_1);
+        il.Emit(OpCodes.Ret);
     }
 
     private static string[] UniqueNames(IEnumerable<string> names)

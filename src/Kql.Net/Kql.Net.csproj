@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Description>Run Kusto Query Language (KQL) queries over .NET objects, JSON, CSV, DataTables and IQueryable/EF Core sources. Queries are parsed with Microsoft.Azure.Kusto.Language and compiled to LINQ expression trees.</Description>
   </PropertyGroup>
 
   <ItemGroup>

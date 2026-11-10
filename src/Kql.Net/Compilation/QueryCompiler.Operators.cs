@@ -198,6 +198,36 @@ internal sealed partial class QueryCompiler
                 q => ExpressionHelpers.ToClientQuery((IEnumerable)run.Invoke(null, [q, fn])!, input.Schema.RowType), "where");
         }
 
+        // `a and b and c` where only some conjuncts need in-memory evaluation: filter by the others first (in the
+        // provider), then by the rest. A row passes `a and b` only when both are true, so this is the same filter.
+        var conjuncts = Conjuncts(condition);
+        if (conjuncts.Count > 1)
+        {
+            var needsClient = conjuncts.Select(c => new ScalarCompiler(this, input.Schema, RowParam(input.Schema), translator: input.Translator,
+                    approximationRoot: input.Translator is null ? null : c)
+                .CompileAndReport(c)).ToList();
+            if (needsClient.Any(x => x) && needsClient.Any(x => !x))
+            {
+                var node = input;
+                foreach (var c in conjuncts.Where((_, i) => !needsClient[i]).Concat(conjuncts.Where((_, i) => needsClient[i])))
+                    node = WhereCore(node, c);
+                return node;
+            }
+        }
+        return WhereCore(input, condition);
+    }
+
+    private static List<KExpr> Conjuncts(KExpr e)
+    {
+        while (e is ParenthesizedExpression p) e = p.Expression;
+        return e is Kusto.Language.Syntax.BinaryExpression { Kind: SyntaxKind.AndExpression } and
+            ? [.. Conjuncts(and.Left), .. Conjuncts(and.Right)]
+            : [e];
+    }
+
+    private PlanNode WhereCore(PlanNode input, KExpr condition)
+    {
+
         var plain = WhereNode(input, condition, null).Node;
         if (input.Translator is not { } translator) return plain;
 
@@ -223,38 +253,131 @@ internal sealed partial class QueryCompiler
 
     private PlanNode Extend(PlanNode input, IReadOnlyList<KExpr> expressions, TableSymbol output, string name = "extend")
     {
-        var assigned = new Dictionary<string, KExpr>(StringComparer.Ordinal);
-        var unnamed = new Queue<KExpr>();
-        foreach (var e in expressions)
+        var (staged, tuples) = MaterializeTuples(input, expressions, name);
+
+        // Output columns that aren't input columns, in the order the expressions introduce them.
+        var fresh = new Queue<string>(output.Columns.Select(c => c.Name).Where(n => input.Schema.Find(n) is null));
+        string Next(string? expected = null)
         {
-            if (e is SimpleNamedExpression sn) assigned[sn.Name.SimpleName] = sn.Expression;
-            else if (e is CompoundNamedExpression) throw new KqlNotSupportedException("tuple assignment in extend", e.TextStart);
-            else if (e is NameReference { ReferencedSymbol: ColumnSymbol }) continue;
-            else unnamed.Enqueue(e);
-        }
-        foreach (var c in output.Columns)
-        {
-            if (unnamed.Count == 0) break;
-            if (!assigned.ContainsKey(c.Name) && input.Schema.Find(c.Name) is null) assigned[c.Name] = unnamed.Dequeue();
+            if (expected is not null && (fresh.Count == 0 || fresh.Peek() != expected)) return expected; // replaces an input column
+            return fresh.Dequeue();
         }
 
-        var columns = Columns(output, input, _ => true);
-        return Select(input, columns, (compiler, row) => columns.Select(c =>
-            assigned.TryGetValue(c.Name, out var expr) ? compiler.Compile(expr) : compiler.Read(input.Schema.Get(c.Name), row)).ToList(),
+        var assigned = new Dictionary<string, Func<ScalarCompiler, LExpr, Type, LExpr>>(StringComparer.Ordinal);
+        foreach (var e in expressions)
+        {
+            switch (e)
+            {
+                case SimpleNamedExpression sn:
+                {
+                    var expr = sn.Expression;
+                    assigned[Next(sn.Name.SimpleName)] = (c, _, _) => c.Compile(expr);
+                    break;
+                }
+                case CompoundNamedExpression cn:
+                {
+                    var names = cn.Names.Names.Select(x => x.Element.SimpleName).ToList();
+                    for (var k = 0; k < names.Count; k++) assigned[Next(names[k])] = TupleItem(staged, tuples[cn.Expression], k);
+                    break;
+                }
+                case NameReference { ReferencedSymbol: ColumnSymbol }:
+                    break;
+                default:
+                    if (tuples.TryGetValue(e, out var hidden))
+                    {
+                        var width = ((TupleSymbol)e.ResultType).Columns.Count;
+                        for (var k = 0; k < width && fresh.Count > 0; k++) assigned[Next()] = TupleItem(staged, hidden, k);
+                    }
+                    else if (fresh.Count > 0)
+                    {
+                        var expr = e;
+                        assigned[Next()] = (c, _, _) => c.Compile(expr);
+                    }
+                    break;
+            }
+        }
+
+        var columns = Columns(output, staged, n => input.Schema.Find(n) is not null);
+        return Select(staged, columns, (compiler, row) => columns.Select(c =>
+            assigned.TryGetValue(c.Name, out var value)
+                ? value(compiler, row, KqlTypes.ClrTypeFor(c.Type))
+                : compiler.Read(staged.Schema.Get(c.Name), row)).ToList(),
             name, expressions);
     }
 
     private PlanNode Project(PlanNode input, IReadOnlyList<KExpr> expressions, TableSymbol output, string name)
     {
-        if (expressions.Count != output.Columns.Count || expressions.Any(e => e is CompoundNamedExpression))
+        var width = expressions.Sum(e => TupleSource(e)?.ResultType is TupleSymbol t ? t.Columns.Count : 1);
+        if (width != output.Columns.Count)
         {
-            // wildcards / tuple results: fall back to name matching
+            // wildcards: fall back to name matching
             if (expressions.All(e => e is NameReference or SimpleNamedExpression { Expression: NameReference }))
                 return Reshape(input, output, RenameMap(expressions), name);
-            throw new KqlNotSupportedException($"{name} with wildcard or tuple expressions", expressions.FirstOrDefault()?.TextStart ?? 0);
+            throw new KqlNotSupportedException($"{name} with wildcard expressions", expressions.FirstOrDefault()?.TextStart ?? 0);
         }
-        return Select(input, Columns(output, input), (compiler, _) => expressions.Select(compiler.Compile).ToList(), name, expressions);
+
+        var (staged, tuples) = MaterializeTuples(input, expressions, name);
+        if (tuples.Count == 0)
+            return Select(input, Columns(output, input), (compiler, _) => expressions.Select(compiler.Compile).ToList(), name, expressions);
+
+        var values = new List<Func<ScalarCompiler, LExpr, Type, LExpr>>();
+        foreach (var e in expressions)
+        {
+            if (TupleSource(e) is { } call)
+            {
+                for (var k = 0; k < ((TupleSymbol)call.ResultType).Columns.Count; k++) values.Add(TupleItem(staged, tuples[call], k));
+            }
+            else
+            {
+                var expr = e;
+                values.Add((c, _, _) => c.Compile(expr));
+            }
+        }
+        var columns = Columns(output, staged, _ => false);
+        return Select(staged, columns, (compiler, row) =>
+            columns.Select((c, i) => values[i](compiler, row, KqlTypes.ClrTypeFor(c.Type))).ToList(), name, expressions);
     }
+
+    /// <summary>The call behind an expression that yields several columns (e.g. <c>series_decompose(y)</c>), if any.</summary>
+    private static KExpr? TupleSource(KExpr e)
+    {
+        var inner = e switch
+        {
+            CompoundNamedExpression cn => cn.Expression,
+            SimpleNamedExpression sn => sn.Expression,
+            _ => e
+        };
+        return inner.ResultType is TupleSymbol ? inner : null;
+    }
+
+    /// <summary>
+    /// Evaluates every multi-column call once into a hidden column (an object?[] with one element per column), so the
+    /// columns unpacked from it share a single evaluation. Returns the staged input and each call's hidden column.
+    /// </summary>
+    private (PlanNode Input, Dictionary<KExpr, string> Hidden) MaterializeTuples(PlanNode input, IReadOnlyList<KExpr> expressions, string name)
+    {
+        var calls = expressions.Select(TupleSource).OfType<KExpr>().ToList();
+        var hidden = new Dictionary<KExpr, string>();
+        if (calls.Count == 0) return (input, hidden);
+
+        var columns = input.Schema.Columns.Select(c => (c.Name, c.KqlType)).ToList();
+        foreach (var call in calls)
+        {
+            hidden[call] = $"__tuple{hidden.Count}";
+            columns.Add((hidden[call], ScalarTypes.Dynamic));
+        }
+        var staged = Select(input, columns, (compiler, row) =>
+            input.Schema.Columns.Select(c => compiler.Read(c, row))
+                .Concat(calls.Select(call => ExpressionHelpers.Coerce(compiler.Compile(call), typeof(object))))
+                .ToList(), name, calls);
+        return (staged, hidden);
+    }
+
+    private static readonly System.Reflection.MethodInfo TupleItemMethod = typeof(ExpressionHelpers).GetMethod(nameof(ExpressionHelpers.TupleItem))!;
+
+    private static Func<ScalarCompiler, LExpr, Type, LExpr> TupleItem(PlanNode staged, string hidden, int index) =>
+        (compiler, row, type) => ExpressionHelpers.Coerce(
+            LExpr.Call(TupleItemMethod, compiler.Read(staged.Schema.Get(hidden), row), LExpr.Constant(index)), type);
 
     /// <summary>new name -> old name for `new = old` pairs.</summary>
     private static Dictionary<string, string> RenameMap(IEnumerable<KExpr> expressions)
@@ -504,13 +627,14 @@ internal sealed partial class QueryCompiler
         var output = (TableSymbol)dt.ResultType;
         var schema = RowSchema.Emit(Columns(output));
         var compiler = new ScalarCompiler(this, null, null);
-        var values = dt.Values.Select(v => LExpr.Lambda(LExpr.Convert(compiler.Compile(v.Element), typeof(object))).Compile().DynamicInvoke()).ToList();
+        var values = dt.Values.Select(v => ExpressionHelpers.Evaluate(compiler.Compile(v.Element))).ToList();
         var width = schema.Columns.Count;
+        var create = RowFactory.For(schema);
         var rows = new List<object>();
         for (var i = 0; i + width <= values.Count; i += width)
         {
             var args = schema.Columns.Select((c, j) => KqlConvert.ChangeType(values[i + j], c.ClrType)).ToArray();
-            rows.Add(schema.Constructor!.Invoke(args));
+            rows.Add(create(args));
         }
         return new RowsNode(schema, () => rows.CastTo(schema.RowType));
     }
@@ -522,8 +646,8 @@ internal sealed partial class QueryCompiler
         var compiler = new ScalarCompiler(this, null, null);
         var exprs = print.Expressions.Select(x => x.Element).ToList();
         var body = schema.New(exprs.Select(compiler.Compile).ToList());
-        var create = LExpr.Lambda(LExpr.Convert(body, typeof(object))).Compile();
-        return new RowsNode(schema, () => new[] { create.DynamicInvoke()! }.CastTo(schema.RowType));
+        var create = LExpr.Lambda<Func<object>>(LExpr.Convert(body, typeof(object))).Compile(preferInterpretation: true);
+        return new RowsNode(schema, () => new[] { create() }.CastTo(schema.RowType));
     }
 
     private PlanNode Range(RangeOperator range)
@@ -533,7 +657,6 @@ internal sealed partial class QueryCompiler
         var from = EvaluateScalar(range.From);
         var to = EvaluateScalar(range.To);
         var step = EvaluateScalar(range.Step);
-        var ctor = schema.Constructor!;
         var colType = schema.Columns[0].ClrType;
 
         IEnumerable<object?> Values()
@@ -559,7 +682,8 @@ internal sealed partial class QueryCompiler
             }
         }
 
-        return new RowsNode(schema, () => Values().Select(v => ctor.Invoke([KqlConvert.ChangeType(v, colType)])).CastTo(schema.RowType));
+        var create = RowFactory.For(schema);
+        return new RowsNode(schema, () => Values().Select(v => create([KqlConvert.ChangeType(v, colType)])).CastTo(schema.RowType));
     }
 }
 

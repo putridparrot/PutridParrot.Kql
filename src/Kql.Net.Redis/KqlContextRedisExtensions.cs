@@ -24,4 +24,15 @@ public static class KqlContextRedisExtensions
     public static KqlContext AddRedisStream(this KqlContext context, string name, IConnectionMultiplexer redis, string streamKey,
         RedisSourceOptions? options = null) =>
         context.AddTable(name, RedisTableSources.Stream(redis, streamKey, options));
+
+    /// <summary>
+    /// A RediSearch index (FT.CREATE ... ON HASH or ON JSON): one row per indexed document, one column per attribute.
+    /// <c>where</c> conditions on NUMERIC and TAG attributes (and TEXT, with <see cref="Search.RedisSearchOptions.PushDownText"/>),
+    /// <c>take</c>, numeric <c>top</c>/<c>sort | take</c> and <c>count</c> run in Redis as FT.SEARCH; the rest of the query
+    /// runs in memory. Requires the RediSearch module (Redis Stack / Redis 8).
+    /// </summary>
+    public static KqlContext AddRedisSearch(this KqlContext context, string name, IConnectionMultiplexer redis, string index,
+        Search.RedisSearchOptions? options = null) =>
+        context.AddTranslator(Search.RedisSearchTranslator.Instance)
+            .AddTable(name, new Search.RedisSearchTableSource(redis, index, options));
 }

@@ -15,6 +15,7 @@ internal sealed partial class QueryCompiler
 {
     private PlanNode Evaluate(PlanNode input, EvaluateOperator op, TableSymbol output)
     {
+        MarkNotCacheable(); // the output columns come from the data
         var name = op.FunctionCall.Name.SimpleName;
         var args = op.FunctionCall.ArgumentList.Expressions.Select(e => e.Element).ToList();
         return name switch
@@ -31,9 +32,9 @@ internal sealed partial class QueryCompiler
     private static RowsNode Rows(IReadOnlyList<(string Name, ScalarSymbol Type)> columns, IEnumerable<object?[]> values)
     {
         var schema = RowSchema.Emit(columns);
-        var ctor = schema.Constructor!;
+        var create = RowFactory.For(schema);
         var types = schema.Columns.Select(c => c.ClrType).ToArray();
-        var rows = values.Select(v => ctor.Invoke(types.Select((t, i) =>
+        var rows = values.Select(v => create(types.Select((t, i) =>
             t == typeof(object) ? Dynamic.Normalize(v[i]) : KqlConvert.ChangeType(v[i], t)).ToArray())).ToList();
         return new RowsNode(schema, () => rows.CastTo(schema.RowType));
     }
@@ -118,7 +119,7 @@ internal sealed partial class QueryCompiler
     private PlanNode Pivot(PlanNode input, List<KExpr> args, TableSymbol output)
     {
         var rowType = input.Schema.RowType;
-        var pivotFn = (Delegate)RowFunction(input, args[0]);
+        var pivotFn = AsObjectFunc(RowFunction(input, args[0]), rowType);
         var aggregate = args.Count > 1 ? AggregateOverRows(input, args[1]) : null;
         var aggType = args.Count > 1 ? RowSchema.AsScalar(args[1].ResultType) : ScalarTypes.Long;
 
@@ -127,37 +128,64 @@ internal sealed partial class QueryCompiler
         var reader = RowReader.For(input.Schema);
         var all = input.Schema.Columns.ToList();
         var groupIdx = groupCols.Select(c => all.IndexOf(c)).ToArray();
-
-        var rows = ReadAll(input);
-        var typed = (IList)typeof(Enumerable).GetMethod(nameof(Enumerable.ToList))!.MakeGenericMethod(rowType)
-            .Invoke(null, [rows.CastTo(rowType)])!;
         var listType = typeof(List<>).MakeGenericType(rowType);
 
         var groups = new List<(object?[] Key, Dictionary<string, IList> ByPivot)>();
+        var groupIndex = new Dictionary<object?[], int>(KeyComparer.Instance);
         var pivotValues = new SortedSet<string>(StringComparer.Ordinal);
-        foreach (var row in typed)
+        foreach (var row in input.Execute())
         {
             var values = reader(row!);
-            var key = groupIdx.Select(i => values[i]).ToArray();
-            var group = groups.FirstOrDefault(g => g.Key.Zip(key).All(p => KqlComparer.ValueEquals(p.First, p.Second)));
-            if (group.Key is null)
+            var key = new object?[groupIdx.Length];
+            for (var i = 0; i < key.Length; i++) key[i] = values[groupIdx[i]];
+            if (!groupIndex.TryGetValue(key, out var gi))
             {
-                group = (key, new Dictionary<string, IList>(StringComparer.Ordinal));
-                groups.Add(group);
+                groupIndex[key] = gi = groups.Count;
+                groups.Add((key, new Dictionary<string, IList>(StringComparer.Ordinal)));
             }
-            var pv = KqlConvert.ToStringValue(pivotFn.DynamicInvoke(row)) ?? "";
+            var byPivot = groups[gi].ByPivot;
+            var pv = KqlConvert.ToStringValue(pivotFn(row!)) ?? "";
             pivotValues.Add(pv);
-            if (!group.ByPivot.TryGetValue(pv, out var list)) group.ByPivot[pv] = list = (IList)Activator.CreateInstance(listType)!;
+            if (!byPivot.TryGetValue(pv, out var list)) byPivot[pv] = list = (IList)Activator.CreateInstance(listType)!;
             list.Add(row);
         }
 
+        var aggregateFn = aggregate is null ? null : AsObjectFunc(aggregate, typeof(IEnumerable<>).MakeGenericType(rowType));
         var columns = groupCols.Select(c => (c.Name, c.KqlType)).Concat(pivotValues.Select(v => (v, aggType))).ToList();
-        var empty = Activator.CreateInstance(listType)!;
+        var empty = (IList)Activator.CreateInstance(listType)!;
         return Rows(columns, groups.Select(g => g.Key.Concat(pivotValues.Select(v =>
         {
-            var bucket = g.ByPivot.TryGetValue(v, out var list) ? list : (IList)empty;
-            return aggregate is null ? (object?)(long)bucket.Count : aggregate.DynamicInvoke(bucket);
+            var bucket = g.ByPivot.TryGetValue(v, out var list) ? list : empty;
+            return aggregateFn is null ? (object?)(long)bucket.Count : aggregateFn(bucket);
         })).ToArray()));
+    }
+
+    /// <summary>Wraps a compiled <c>Func&lt;T, object?&gt;</c> as <c>Func&lt;object, object?&gt;</c> without DynamicInvoke.</summary>
+    private static Func<object, object?> AsObjectFunc(Delegate fn, Type argType)
+    {
+        var p = LExpr.Parameter(typeof(object), "x");
+        var call = LExpr.Invoke(LExpr.Constant(fn), LExpr.Convert(p, argType));
+        return LExpr.Lambda<Func<object, object?>>(call, p).Compile();
+    }
+
+    /// <summary>Hashes/compares group keys (value arrays) with KQL value equality.</summary>
+    private sealed class KeyComparer : IEqualityComparer<object?[]>
+    {
+        public static readonly KeyComparer Instance = new();
+
+        public bool Equals(object?[]? x, object?[]? y)
+        {
+            if (x is null || y is null || x.Length != y.Length) return x == y;
+            for (var i = 0; i < x.Length; i++) if (!KqlComparer.ValueEquals(x[i], y[i])) return false;
+            return true;
+        }
+
+        public int GetHashCode(object?[] key)
+        {
+            var hash = 17;
+            foreach (var v in key) hash = hash * 31 + KqlComparer.ValueHash(v);
+            return hash;
+        }
     }
 
     // ------------------------------------------------------------------ narrow
@@ -169,13 +197,14 @@ internal sealed partial class QueryCompiler
         return new RowsNode(RowSchema.Emit([("Row", ScalarTypes.Long), ("Column", ScalarTypes.String), ("Value", ScalarTypes.String)]), () =>
         {
             var schema = RowSchema.Emit([("Row", ScalarTypes.Long), ("Column", ScalarTypes.String), ("Value", ScalarTypes.String)]);
+            var create = RowFactory.For(schema);
             var result = new List<object>();
             long i = 0;
             foreach (var row in input.Execute())
             {
                 var values = reader(row);
                 for (var c = 0; c < names.Length; c++)
-                    result.Add(schema.Constructor!.Invoke([(long?)i, names[c], values[c] is null ? null : KqlConvert.ToStringValue(values[c])]));
+                    result.Add(create([(long?)i, names[c], values[c] is null ? null : KqlConvert.ToStringValue(values[c])]));
                 i++;
             }
             return result.CastTo(schema.RowType);

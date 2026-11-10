@@ -12,6 +12,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Description>Redis sources for Kql.Net: query Redis strings, hashes, JSON documents, streams and RediSearch indexes (with filters pushed into FT.SEARCH) with KQL.</Description>
+    <PackageTags>$(PackageTags);redis;redisearch</PackageTags>
   </PropertyGroup>
 
 </Project>

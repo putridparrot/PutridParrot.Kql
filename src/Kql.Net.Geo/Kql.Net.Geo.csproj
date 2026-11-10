@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Kql.Net\Kql.Net.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NetTopologySuite" Version="2.6.0" />
+    <PackageReference Include="pocketken.H3" Version="4.5.0.1" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>Extra geospatial functions for Kql.Net: H3 cells, buffers, unions and polygon intersections (built on NetTopologySuite and pocketken.H3), plus geo_info_from_ip_address over your own IP lookup.</Description>
+    <PackageTags>$(PackageTags);geo;geospatial;h3;gis</PackageTags>
+  </PropertyGroup>
+
+</Project>

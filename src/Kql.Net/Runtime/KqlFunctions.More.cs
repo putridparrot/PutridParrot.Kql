@@ -267,18 +267,22 @@ public static partial class KqlFunctions
         var sa = Distinct(Arr(a));
         var sb = Distinct(Arr(b));
         var union = Distinct(sa.Concat(sb)).Count;
-        return union == 0 ? 0 : (double)sa.Count(x => sb.Any(y => KqlComparer.ValueEquals(x, y))) / union;
+        var inB = Set(sb);
+        return union == 0 ? 0 : (double)sa.Count(inB.Contains) / union;
     }
 
     // ---------------------------------------------------------------- sets
 
     private static List<object?> Distinct(IEnumerable<object?> values)
     {
+        var seen = new HashSet<object?>(KqlComparer.Values);
         var result = new List<object?>();
         foreach (var v in values)
-            if (!result.Any(x => KqlComparer.ValueEquals(x, v))) result.Add(v);
+            if (seen.Add(v)) result.Add(v);
         return result;
     }
+
+    private static HashSet<object?> Set(IEnumerable<object?> values) => new(values, KqlComparer.Values);
 
     [KqlFunction("set_union")] public static object? SetUnion(params object?[] arrays) => Distinct(arrays.SelectMany(Arr));
 
@@ -286,25 +290,20 @@ public static partial class KqlFunctions
     public static object? SetIntersect(params object?[] arrays)
     {
         if (arrays.Length == 0) return new List<object?>();
-        var others = arrays.Skip(1).Select(Arr).ToList();
-        return Distinct(Arr(arrays[0])).Where(v => others.All(o => o.Any(x => KqlComparer.ValueEquals(x, v)))).ToList();
+        var others = arrays.Skip(1).Select(a => Set(Arr(a))).ToList();
+        return Distinct(Arr(arrays[0])).Where(v => others.All(o => o.Contains(v))).ToList();
     }
 
     [KqlFunction("set_difference")]
     public static object? SetDifference(params object?[] arrays)
     {
         if (arrays.Length == 0) return new List<object?>();
-        var others = arrays.Skip(1).SelectMany(Arr).ToList();
-        return Distinct(Arr(arrays[0])).Where(v => !others.Any(x => KqlComparer.ValueEquals(x, v))).ToList();
+        var others = Set(arrays.Skip(1).SelectMany(Arr));
+        return Distinct(Arr(arrays[0])).Where(v => !others.Contains(v)).ToList();
     }
 
     [KqlFunction("set_equals")]
-    public static bool? SetEquals(object? a, object? b)
-    {
-        var sa = Distinct(Arr(a));
-        var sb = Distinct(Arr(b));
-        return sa.Count == sb.Count && sa.All(x => sb.Any(y => KqlComparer.ValueEquals(x, y)));
-    }
+    public static bool? SetEquals(object? a, object? b) => Set(Arr(a)).SetEquals(Set(Arr(b)));
 
     // ---------------------------------------------------------------- bags
 

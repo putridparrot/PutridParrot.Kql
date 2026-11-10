@@ -18,6 +18,21 @@ internal abstract class PlanNode(RowSchema schema)
     public virtual IKqlQueryTranslator? Translator => null;
 
     public abstract IQueryable Execute();
+
+    /// <summary>Caches the compiled delegate that runs this node's output in memory (see <see cref="ExecutorSlot"/>).</summary>
+    private readonly ExecutorSlot _executor = new();
+
+    /// <summary>Executes the node and returns its rows; in-memory queries run through a cached compiled delegate.</summary>
+    public IEnumerable Rows(IQueryable? executed = null) => _executor.Bind(executed ?? Execute());
+
+    /// <summary>
+    /// An in-memory input query about to be consumed by an in-memory operator, run through <paramref name="slot"/>
+    /// (provider-backed and already-materialised inputs are returned unchanged).
+    /// </summary>
+    protected static IQueryable Bound(ExecutorSlot slot, IQueryable q, Type rowType) =>
+        ExpressionHelpers.IsInMemory(q) && q.Expression is not System.Linq.Expressions.ConstantExpression
+            ? ExpressionHelpers.ToClientQuery(slot.Bind(q), rowType)
+            : q;
 }
 
 /// <summary>A table registered with the context.</summary>
@@ -49,6 +64,7 @@ internal sealed class OperatorNode(PlanNode input, RowSchema schema, bool requir
 {
     public PlanNode Input { get; } = input;
     public bool RequiresClient { get; } = requiresClient;
+    private readonly ExecutorSlot _inputExecutor = new();
     public string Name { get; } = name;
 
     public override IKqlQueryTranslator? Translator => (keepsProvider ?? !RequiresClient) ? Input.Translator : null;
@@ -58,8 +74,8 @@ internal sealed class OperatorNode(PlanNode input, RowSchema schema, bool requir
     /// <summary>Applies this operator to an already-executed input query.</summary>
     public IQueryable ApplyTo(IQueryable q)
     {
-        if (RequiresClient && !ExpressionHelpers.IsInMemory(q))
-            q = ExpressionHelpers.ToClientQuery(q, Input.Schema.RowType);
+        if (RequiresClient)
+            q = ExpressionHelpers.IsInMemory(q) ? Bound(_inputExecutor, q, Input.Schema.RowType) : ExpressionHelpers.ToClientQuery(q, Input.Schema.RowType);
         return apply(q);
     }
 
@@ -74,5 +90,9 @@ internal sealed class CombineNode(IReadOnlyList<PlanNode> inputs, RowSchema sche
 {
     public override IKqlQueryTranslator? Translator => translator;
 
-    public override IQueryable Execute() => apply(inputs.Select(i => i.Execute()).ToList());
+    private readonly ExecutorSlot[] _inputExecutors = inputs.Select(_ => new ExecutorSlot()).ToArray();
+
+    // in-memory inputs run through cached delegates; a combination that stays in the provider composes as it is
+    public override IQueryable Execute() => apply(inputs.Select((input, i) =>
+        translator is null ? Bound(_inputExecutors[i], input.Execute(), input.Schema.RowType) : input.Execute()).ToList());
 }

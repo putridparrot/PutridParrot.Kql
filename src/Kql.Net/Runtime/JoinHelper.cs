@@ -16,7 +16,7 @@ public enum JoinKind
 /// <summary>In-memory implementation of the KQL join flavours.</summary>
 public static class JoinHelper
 {
-    private static bool HasNull<TKey>(TKey key) => key is KqlRow row && row.GetValues().Any(v => v is null);
+    private static bool HasNull<TKey>(TKey key) => key is KqlRow row && row.HasNullValue();
 
     public static IEnumerable<TOut> Join<TL, TR, TKey, TOut>(
         IEnumerable<TL> left, IEnumerable<TR> right,

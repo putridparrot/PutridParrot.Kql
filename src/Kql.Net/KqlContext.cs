@@ -26,6 +26,18 @@ public sealed class KqlContext
     private readonly List<IKqlQueryTranslator> _translators = [];
     private GlobalState? _globals;
     private int _globalsFunctionVersion = -1;
+    private int _version;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, CachedPlans> _planCache = new(StringComparer.Ordinal);
+
+    private sealed record CachedPlans(int Version, int FunctionsVersion, IReadOnlyList<PlanNode> Plans);
+
+    /// <summary>
+    /// How many compiled queries to keep for reuse (default 256; 0 turns caching off). A query run again reuses its
+    /// compiled plan and in-memory delegates, which makes repeated queries over small tables many times faster.
+    /// Queries whose compilation reads data or the clock (<c>now()</c>, <c>ago()</c>, <c>toscalar</c>, pivot...) are
+    /// never cached. Registering a table, function or translator clears the cache.
+    /// </summary>
+    public int PlanCacheSize { get; set; } = 256;
 
     /// <summary>
     /// Scalar functions for this context: the built-ins plus anything registered here. Registering affects only
@@ -58,7 +70,11 @@ public sealed class KqlContext
     public KqlContext AddTranslator(IKqlQueryTranslator translator)
     {
         ArgumentNullException.ThrowIfNull(translator);
-        if (!_translators.Contains(translator)) _translators.Add(translator);
+        if (!_translators.Contains(translator))
+        {
+            _translators.Add(translator);
+            _version++;
+        }
         return this;
     }
 
@@ -125,12 +141,15 @@ public sealed class KqlContext
         ArgumentNullException.ThrowIfNull(source);
         _tables[name] = new TableBinding(name, source, RowSchema.FromClrType(source.ElementType));
         _globals = null;
+        _version++;
         return this;
     }
 
     public KqlContext RemoveTable(string name)
     {
-        if (_tables.Remove(name)) _globals = null;
+        if (!_tables.Remove(name)) return this;
+        _globals = null;
+        _version++;
         return this;
     }
 
@@ -181,13 +200,26 @@ public sealed class KqlContext
     private IReadOnlyList<PlanNode> Compile(string query)
     {
         ArgumentNullException.ThrowIfNull(query);
+        var functionsVersion = Functions.Version;
+        if (PlanCacheSize > 0 && _planCache.TryGetValue(query, out var cached)
+            && cached.Version == _version && cached.FunctionsVersion == functionsVersion)
+            return cached.Plans;
+
         var code = KustoCode.ParseAndAnalyze(query, Globals);
         var errors = code.GetDiagnostics()
             .Where(d => d.Severity == "Error")
             .Select(d => new KqlDiagnostic(d.Code, d.Severity, d.Message, d.Start, d.Length))
             .ToList();
         if (errors.Count > 0) throw new KqlException(errors);
-        return new QueryCompiler(code, _tables, _translators, Functions).Compile();
+        var version = _version;
+        var compiler = new QueryCompiler(code, _tables, _translators, Functions);
+        var plans = compiler.Compile();
+        if (PlanCacheSize > 0 && compiler.Cacheable)
+        {
+            if (_planCache.Count >= PlanCacheSize) _planCache.Clear();
+            _planCache[query] = new CachedPlans(version, functionsVersion, plans);
+        }
+        return plans;
     }
 
     private static List<KqlColumn> ResultColumns(PlanNode plan) => plan.Schema.Columns
@@ -198,7 +230,7 @@ public sealed class KqlContext
     {
         var reader = RowReader.For(plan.Schema);
         var rows = new List<object?[]>();
-        foreach (var row in (IEnumerable)plan.Execute()) rows.Add(reader(row!));
+        foreach (var row in plan.Rows()) rows.Add(reader(row!));
         return new KqlResult(ResultColumns(plan), rows);
     }
 
@@ -234,7 +266,7 @@ public sealed class KqlContext
             await foreach (var row in async.WithCancellation(cancellationToken).ConfigureAwait(false)) yield return reader(row);
             yield break;
         }
-        foreach (var row in (IEnumerable)query)
+        foreach (var row in plan.Rows(query))
         {
             cancellationToken.ThrowIfCancellationRequested();
             yield return reader(row!);

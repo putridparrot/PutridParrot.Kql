@@ -61,7 +61,7 @@ public sealed class RowSetTableSource : IKqlTableSource
         var schema = RowSchema.Emit(kqlColumns);
         ElementType = schema.RowType;
         _rows = rows;
-        var ctor = schema.Constructor!;
+        var create = RowFactory.For(schema);
         var types = schema.Columns.Select(c => c.ClrType).ToArray();
         _create = values =>
         {
@@ -72,7 +72,7 @@ public sealed class RowSetTableSource : IKqlTableSource
                 if (v is DBNull) v = null;
                 args[i] = types[i] == typeof(object) ? Dynamic.Normalize(v) : KqlConvert.ChangeType(v, types[i]);
             }
-            return ctor.Invoke(args);
+            return create(args);
         };
     }
 
@@ -80,6 +80,12 @@ public sealed class RowSetTableSource : IKqlTableSource
 
     /// <summary>The columns (names and CLR types; <c>object</c> = dynamic) this source was created with.</summary>
     public IReadOnlyList<(string Name, Type Type)> Columns { get; }
+
+    /// <summary>
+    /// Creates one row of <see cref="ElementType"/> from values in column order (converted to the column types), for
+    /// sources that fetch rows themselves, such as a custom <see cref="IQueryProvider"/>.
+    /// </summary>
+    public object CreateRow(object?[] values) => _create(values);
 
     public IQueryable GetQuery()
     {

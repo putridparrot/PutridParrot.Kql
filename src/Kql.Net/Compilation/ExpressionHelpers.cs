@@ -11,6 +11,22 @@ internal static class ExpressionHelpers
     private static readonly MethodInfo ToGeneric = typeof(KqlConvert).GetMethod(nameof(KqlConvert.To))!;
     private static readonly MethodInfo ToStringValue = typeof(KqlConvert).GetMethod(nameof(KqlConvert.ToStringValue))!;
 
+    /// <summary>
+    /// Evaluates a parameterless expression once (constant folding, let values, datatable cells). Constants are read
+    /// directly; anything else is interpreted rather than JIT-compiled, which is much cheaper for a single call.
+    /// </summary>
+    public static object? Evaluate(Expression e) => e switch
+    {
+        ConstantExpression c => c.Value,
+        UnaryExpression { NodeType: ExpressionType.Convert or ExpressionType.ConvertChecked, Operand: ConstantExpression c } u
+            when c.Value is null || u.Type.IsAssignableFrom(c.Value.GetType()) || Nullable.GetUnderlyingType(u.Type) == c.Value.GetType() => c.Value,
+        _ => Expression.Lambda<Func<object?>>(Expression.Convert(e, typeof(object))).Compile(preferInterpretation: true)()
+    };
+
+    /// <summary>Element <paramref name="index"/> of a multi-column function result (an object?[]), or null.</summary>
+    public static object? TupleItem(object? tuple, int index) =>
+        tuple is object?[] items && index < items.Length ? items[index] : null;
+
     /// <summary>Converts an expression to the target runtime type using KQL conversion rules.</summary>
     public static Expression Coerce(Expression e, Type target)
     {

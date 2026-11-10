@@ -58,8 +58,9 @@ public static class RedisTableSources
             (batch, key) => batch.HashGetAllAsync(key), (key, fields) => (key, fields));
 
         var sample = Fetch().Take(o.InferenceSampleSize).ToList();
+        // SCAN order isn't stable, so take field order from the sample in key order (stable column order across runs)
         var fieldNames = new List<string>();
-        foreach (var (_, fields) in sample)
+        foreach (var (_, fields) in sample.OrderBy(s => (string?)s.Key, StringComparer.Ordinal))
             foreach (var f in fields)
                 if (!fieldNames.Contains(f.Name!)) fieldNames.Add(f.Name!);
 

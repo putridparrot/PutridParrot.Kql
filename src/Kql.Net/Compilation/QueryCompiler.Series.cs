@@ -149,6 +149,7 @@ internal sealed partial class QueryCompiler
 
     private PlanNode MvApply(PlanNode input, MvApplyOperator op, TableSymbol output)
     {
+        MarkNotCacheable(); // the sub-query input is passed through shared state
         var rowType = input.Schema.RowType;
         var indexColumn = ParameterValue(op.Parameters, "with_itemindex");
         long? limit = op.RowLimitClause is { } lc ? KqlConvert.ToLong(EvaluateScalar(lc.RowLimit)) : null;

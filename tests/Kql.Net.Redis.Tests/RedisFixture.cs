@@ -48,6 +48,47 @@ public sealed class RedisFixture : IAsyncLifetime
 
         for (var i = 0; i < 25; i++)
             await db.StreamAddAsync("events", [new("type", i % 3 == 0 ? "error" : "info"), new("ms", (i * 10).ToString())]);
+
+        await SeedSearchAsync(db);
+    }
+
+    public const int ProductCount = 200;
+
+    /// <summary>RediSearch indexes: products (ON HASH) and docs (ON JSON).</summary>
+    private static async Task SeedSearchAsync(IDatabase db)
+    {
+        string[] categories = ["Tools", "Garden", "Kitchen", "Home Office"];
+        for (var i = 1; i <= ProductCount; i++)
+        {
+            var fields = new List<HashEntry>
+            {
+                new("name", $"Product {i}"),
+                new("category", categories[i % categories.Length]),
+                new("price", (i * 1.5).ToString(System.Globalization.CultureInfo.InvariantCulture)),
+                new("description", i % 5 == 0 ? "stainless steel_knife set" : "garden hose")
+            };
+            if (i % 10 != 0) fields.Add(new("stock", (i * 7 % 200).ToString())); // unique values; every 10th has none
+            await db.HashSetAsync($"prod:{i}", fields.ToArray());
+        }
+        await db.ExecuteAsync("FT.CREATE", "idx:products", "ON", "HASH", "PREFIX", "1", "prod:", "SCHEMA",
+            "name", "TEXT", "category", "TAG", "price", "NUMERIC", "SORTABLE", "stock", "NUMERIC", "description", "TEXT");
+
+        await db.ExecuteAsync("JSON.SET", "pdoc:1", "$", """{"title":"Alpha","year":1999,"tags":["a","b"]}""");
+        await db.ExecuteAsync("JSON.SET", "pdoc:2", "$", """{"title":"Beta","year":2005,"tags":["b"]}""");
+        await db.ExecuteAsync("JSON.SET", "pdoc:3", "$", """{"title":"Gamma","year":2021,"tags":[]}""");
+        await db.ExecuteAsync("FT.CREATE", "idx:docs", "ON", "JSON", "PREFIX", "1", "pdoc:", "SCHEMA",
+            "$.title", "AS", "title", "TEXT", "$.year", "AS", "year", "NUMERIC", "$.tags[*]", "AS", "tags", "TAG");
+
+        // indexing runs in the background
+        foreach (var (index, expected) in new[] { ("idx:products", ProductCount), ("idx:docs", 3) })
+        {
+            for (var attempt = 0; attempt < 100; attempt++)
+            {
+                var reply = (RedisResult[])(await db.ExecuteAsync("FT.SEARCH", index, "*", "LIMIT", "0", "0"))!;
+                if ((long)reply[0] == expected) break;
+                await Task.Delay(50);
+            }
+        }
     }
 
     public async Task DisposeAsync()
