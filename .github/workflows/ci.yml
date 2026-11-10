@@ -37,13 +37,13 @@ jobs:
           fi
 
       - name: Restore
-        run: dotnet restore Kql.Net.slnx
+        run: dotnet restore PutridParrot.Kql.slnx
 
       - name: Build
-        run: dotnet build Kql.Net.slnx -c Release --no-restore -p:Version=${{ steps.version.outputs.version }}
+        run: dotnet build PutridParrot.Kql.slnx -c Release --no-restore -p:Version=${{ steps.version.outputs.version }}
 
       - name: Test
-        run: dotnet test Kql.Net.slnx -c Release --no-build --logger trx --results-directory TestResults
+        run: dotnet test PutridParrot.Kql.slnx -c Release --no-build --logger trx --results-directory TestResults
 
       - name: Upload test results
         if: always()
@@ -53,7 +53,7 @@ jobs:
           path: TestResults
 
       - name: Pack
-        run: dotnet pack Kql.Net.slnx -c Release --no-build -p:Version=${{ steps.version.outputs.version }} -o artifacts
+        run: dotnet pack PutridParrot.Kql.slnx -c Release --no-build -p:Version=${{ steps.version.outputs.version }} -o artifacts
 
       - name: Upload packages
         uses: actions/upload-artifact@v4

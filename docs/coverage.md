@@ -1,6 +1,6 @@
-# Kql.Net coverage
+# PutridParrot.Kql coverage
 
-Parsing and semantic checking cover **all** of KQL: Kql.Net uses Microsoft's `Kusto.Language` parser, so every
+Parsing and semantic checking cover **all** of KQL: PutridParrot.Kql uses Microsoft's `Kusto.Language` parser, so every
 valid query parses, and errors come back as `KqlDiagnostic`s with positions. The tables below list what is
 **executed**. Anything else throws `KqlNotSupportedException` (with the feature name and position) rather than
 returning wrong results.
@@ -9,7 +9,7 @@ returning wrong results.
 provider-backed. "Memory" means it runs in .NET. The query is pushed down up to the first such operator, and
 the rest of the pipeline runs in memory.
 
-## EF Core translations (`Kql.Net.EntityFrameworkCore`)
+## EF Core translations (`PutridParrot.Kql.EntityFrameworkCore`)
 
 The core package has no EF dependency. Plain LINQ already covers comparisons, arithmetic, `and`/`or`, `in`,
 `between`, `iff`, `isnull`/`isempty`, aggregates and `arg_max`. Add the EF package and call
@@ -90,14 +90,14 @@ negated), `like`, `matches regex`, `in`/`!in`/`in~` (literal lists, dynamic arra
 | Encoding / binary | `base64_*` (guid, array), `gzip_*`, `zlib_*`, `binary_and/or/xor/not/shift_*`, `bitset_count_ones` |
 | Time | `datetime_utc_to_local`, `datetime_local_to_utc` (IANA or Windows zone ids), `datetime_list_timezones`, `unixtime_microseconds/nanoseconds_todatetime` |
 | Math | also `acos`, `asin`, `atan`, `atan2`, `cot`, `degrees`, `radians` |
-| Sketches | `dcount_hll`, `percentile_tdigest`, `percentiles_array_tdigest`, `rank_tdigest`, `percentrank_tdigest` (Kql.Net's sketches are exact) |
+| Sketches | `dcount_hll`, `percentile_tdigest`, `percentiles_array_tdigest`, `rank_tdigest`, `percentrank_tdigest` (PutridParrot.Kql's sketches are exact) |
 | Geospatial (GeoJSON dynamic values, geodesic edges, metres) | `geo_distance_2points` (sphere, or WGS-84 with `use_spheroid`), `geo_azimuth`, `geo_angle`, `geo_point_in_circle`, `geo_point_in_polygon`, `geo_distance_point_to_line`, `geo_distance_point_to_polygon`, `geo_closest_point_on_line`, `geo_closest_point_on_polygon`, `geo_line_length`, `geo_polygon_area`, `geo_polygon_perimeter`, `geo_line_centroid`, `geo_polygon_centroid`, `geo_line_interpolate_point`, `geo_line_locate_point`, `geo_line_densify`, `geo_polygon_densify`, `geo_line_simplify`, `geo_polygon_simplify`, `geo_intersects_2lines`, `geo_intersects_line_with_polygon`, `geo_intersects_2polygons`, `geo_intersection_2lines`, `geo_from_wkt`, `geo_point_to_geohash`, `geo_geohash_to_central_point`, `geo_geohash_to_polygon`, `geo_geohash_neighbors`, `geo_point_to_s2cell`, `geo_s2cell_to_central_point`, `geo_s2cell_to_polygon`, `geo_s2cell_neighbors`, `geo_polygon_to_s2cells`, `geo_line_to_s2cells` |
 
 Geospatial calculations use a sphere with the Earth's mean radius (6,371,008.8 m). A polygon ring encloses the
 smaller of the two regions it divides the sphere into, whichever way round it is ordered. S2 coverings are at a
 single level and return null above 65,536 cells.
 
-The rest of the geo family comes with the optional `PutridParrot.Kql.Net.Geo` package (built on NetTopologySuite and
+The rest of the geo family comes with the optional `PutridParrot.Kql.Geo` package (built on NetTopologySuite and
 pocketken.H3), enabled with `new KqlContext().UseGeo()`:
 
 | Area | Functions |
@@ -162,7 +162,7 @@ memory.
 `binary_all_and`, `binary_all_or` and `binary_all_xor`.
 
 `hll`, `hll_if`, `hll_merge`, `tdigest`, `tdigest_merge` and `merge_tdigest` are also supported. Kusto uses
-approximate sketches for these; Kql.Net computes exact values instead (fine for in-memory sizes).
+approximate sketches for these; PutridParrot.Kql computes exact values instead (fine for in-memory sizes).
 
 `arg_max`/`arg_min` translate to SQL as one correlated subquery per output column. That is correct, but
 `arg_max(x, *)` on a wide table produces many subqueries.
@@ -181,9 +181,9 @@ approximate sketches for these; Kql.Net computes exact values instead (fine for 
 | CSV | `AddCsvTable("T", path, options)` or `AddTable("T", CsvTableSource.FromText(csv))`. Handles quoted fields, embedded commas and newlines, and custom delimiters. Types are inferred (long, real, bool, datetime, timespan, guid, string) or set explicitly; the file is re-read on each query |
 | `IAsyncEnumerable<T>` | `AddTable("T", asyncRows)`, enumerated on each query, so it must be re-enumerable |
 | Custom | implement `IKqlTableSource` |
-| Redis (`Kql.Net.Redis` package) | `AddRedisStrings`, `AddRedisHashes`, `AddRedisJson` (RedisJSON) and `AddRedisStream`. Keys are found with SCAN and values fetched in pipelined batches; the schema is inferred from a sample and data is read on each query. Operators run in memory. `AddRedisSearch` reads a RediSearch index with filters pushed down (see below) |
+| Redis (`PutridParrot.Kql.Redis` package) | `AddRedisStrings`, `AddRedisHashes`, `AddRedisJson` (RedisJSON) and `AddRedisStream`. Keys are found with SCAN and values fetched in pipelined batches; the schema is inferred from a sample and data is read on each query. Operators run in memory. `AddRedisSearch` reads a RediSearch index with filters pushed down (see below) |
 
-## RediSearch pushdown (`Kql.Net.Redis`)
+## RediSearch pushdown (`PutridParrot.Kql.Redis`)
 
 `AddRedisSearch("T", redis, "idx:name", options)` queries a RediSearch index (FT.CREATE ... ON HASH or ON JSON).
 The table has a `key` column and one column per index attribute: NUMERIC becomes `real`; TAG, TEXT and GEO become

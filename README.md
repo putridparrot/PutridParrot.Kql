@@ -1,20 +1,19 @@
-# Kql.Net
+# PutridParrot.Kql
 
 [![CI](https://github.com/putridparrot/Kql.Net/actions/workflows/ci.yml/badge.svg)](https://github.com/putridparrot/Kql.Net/actions/workflows/ci.yml)
-[![NuGet](https://img.shields.io/nuget/v/PutridParrot.Kql.Net.svg)](https://www.nuget.org/packages/PutridParrot.Kql.Net)
+[![NuGet](https://img.shields.io/nuget/v/PutridParrot.Kql.svg)](https://www.nuget.org/packages/PutridParrot.Kql)
 
 Run [Kusto Query Language (KQL)](https://learn.microsoft.com/kusto/query/) queries over .NET objects and
 databases.
 
 ```
-dotnet add package PutridParrot.Kql.Net
-dotnet add package PutridParrot.Kql.Net.EntityFrameworkCore   # optional: more KQL runs as SQL
-dotnet add package PutridParrot.Kql.Net.Redis                 # optional: Redis sources
-dotnet add package PutridParrot.Kql.Net.Geo                   # optional: H3, buffers, unions, IP geolocation
+dotnet add package PutridParrot.Kql
+dotnet add package PutridParrot.Kql.EntityFrameworkCore   # optional: more KQL runs as SQL
+dotnet add package PutridParrot.Kql.Redis                 # optional: Redis sources
+dotnet add package PutridParrot.Kql.Geo                   # optional: H3, buffers, unions, IP geolocation
 ```
 
-The packages target .NET 10. Namespaces are `Kql.Net`, `Kql.Net.EntityFrameworkCore`, `Kql.Net.Redis` and
-`Kql.Net.Geo`.
+The packages target .NET 10. Each package's namespace matches its name (`PutridParrot.Kql`, `PutridParrot.Kql.Redis`, ...).
 
 ```csharp
 var kql = new KqlContext()
@@ -50,9 +49,9 @@ var table = result.ToDataTable();                // or .ToJson(), .AsDictionarie
 
 ## Entity Framework Core
 
-The core `PutridParrot.Kql.Net` package has no EF dependency, and DbSets work with it as they are. For more of
+The core `PutridParrot.Kql` package has no EF dependency, and DbSets work with it as they are. For more of
 KQL to run in the database (`contains`, `has`, `=~`, `in~`, `startswith`, `bin()`, `tolower()`, `strlen()`...),
-add the `PutridParrot.Kql.Net.EntityFrameworkCore` package:
+add the `PutridParrot.Kql.EntityFrameworkCore` package:
 
 ```csharp
 var kql = new KqlContext()
@@ -73,7 +72,7 @@ GROUP BY "p"."Category" ORDER BY COALESCE(SUM(...), 0.0) DESC
 
 ## Redis
 
-The `PutridParrot.Kql.Net.Redis` package queries Redis data (built on StackExchange.Redis):
+The `PutridParrot.Kql.Redis` package queries Redis data (built on StackExchange.Redis):
 
 ```csharp
 var redis = ConnectionMultiplexer.Connect("localhost");
@@ -97,7 +96,7 @@ kql.Execute("Products | where price > 100 and category == 'Tools' | top 10 by pr
 ## Geospatial
 
 The core package has most of the `geo_*` functions: distances, point-in-polygon, areas, geohash and S2 cells,
-WKT, and others. The `PutridParrot.Kql.Net.Geo` package adds H3 cells, buffers, unions and polygon
+WKT, and others. The `PutridParrot.Kql.Geo` package adds H3 cells, buffers, unions and polygon
 intersections (built on NetTopologySuite and pocketken.H3), plus `geo_info_from_ip_address` over a lookup you
 supply:
 
@@ -120,20 +119,20 @@ See [docs/coverage.md](https://github.com/putridparrot/Kql.Net/blob/main/docs/co
 
 ## Layout
 
-- `src/Kql.Net`: the core library (depends only on Microsoft.Azure.Kusto.Language)
-- `src/Kql.Net.EntityFrameworkCore`: optional EF Core translations
-- `src/Kql.Net.Redis`: optional Redis sources
-- `src/Kql.Net.Geo`: optional geospatial functions (H3, buffers, unions, intersections, IP geolocation)
-- `tests/Kql.Net.Geo.Tests`: tests for the geo package
-- `tests/Kql.Net.Redis.Tests`: Redis tests. They run against a Redis Stack container via Testcontainers and are
+- `src/PutridParrot.Kql`: the core library (depends only on Microsoft.Azure.Kusto.Language)
+- `src/PutridParrot.Kql.EntityFrameworkCore`: optional EF Core translations
+- `src/PutridParrot.Kql.Redis`: optional Redis sources
+- `src/PutridParrot.Kql.Geo`: optional geospatial functions (H3, buffers, unions, intersections, IP geolocation)
+- `tests/PutridParrot.Kql.Geo.Tests`: tests for the geo package
+- `tests/PutridParrot.Kql.Redis.Tests`: Redis tests. They run against a Redis Stack container via Testcontainers and are
   skipped when Docker isn't available
-- `tests/Kql.Net.Tests`: core xUnit tests (no EF)
-- `tests/Kql.Net.EntityFrameworkCore.Tests`: EF Core (SQLite) parity and pushdown tests
-- `samples/Kql.Net.Sample`: console demo (`dotnet run --project samples/Kql.Net.Sample`)
+- `tests/PutridParrot.Kql.Tests`: core xUnit tests (no EF)
+- `tests/PutridParrot.Kql.EntityFrameworkCore.Tests`: EF Core (SQLite) parity and pushdown tests
+- `samples/PutridParrot.Kql.Sample`: console demo (`dotnet run --project samples/PutridParrot.Kql.Sample`)
 
 ## Building and releasing
 
-`dotnet test Kql.Net.slnx` runs every test; `dotnet pack Kql.Net.slnx -c Release -o artifacts` builds the four
+`dotnet test PutridParrot.Kql.slnx` runs every test; `dotnet pack PutridParrot.Kql.slnx -c Release -o artifacts` builds the four
 packages (with symbol packages and Source Link). Shared build settings are in `Directory.Build.props`, and
 package metadata is in `src/Directory.Build.props`.
 

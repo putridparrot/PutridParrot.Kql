@@ -5,9 +5,6 @@
   <!-- NuGet package metadata for the libraries under src/. -->
   <PropertyGroup>
     <IsPackable>true</IsPackable>
-    <!-- "Kql.Net" on nuget.org belongs to an unrelated package, so package ids carry the owner prefix;
-         assembly names and namespaces stay Kql.Net. -->
-    <PackageId>PutridParrot.$(MSBuildProjectName)</PackageId>
     <Authors>Mark Timmings</Authors>
     <Company>PutridParrot</Company>
     <Copyright>Copyright (c) 2026 Mark Timmings</Copyright>
